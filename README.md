@@ -1,51 +1,39 @@
-# DC Remote — Desktop Commander Menubar App
+# Desktop Commander Remote 🖥️⚡
 
 [![Platform](https://img.shields.io/badge/platform-macOS%2012%2B-blue?logo=apple)](https://github.com/samihalawa/desktop-commander-remote/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![GitHub Stars](https://img.shields.io/github/stars/samihalawa/desktop-commander-remote?style=social)](https://github.com/samihalawa/desktop-commander-remote)
 [![Download DMG](https://img.shields.io/badge/Download-DMG%20Installer-blue?logo=apple)](https://github.com/samihalawa/desktop-commander-remote/releases/latest)
 
-**Remote control your Mac from anywhere using AI.** DC Remote is a native macOS menubar app that turns your Mac into a remote-accessible device for [Desktop Commander MCP](https://github.com/wonderwhy-er/DesktopCommanderMCP) — letting Claude, GPT-4, Gemini, and other AI agents control your desktop remotely via the MCP protocol.
+**Your seamless bridge between advanced AI agents and local execution.** Desktop Commander Remote is a lightweight, native macOS menu bar application that connects your local machine to any Model Context Protocol (MCP) compatible AI agent. It allows next-generation AI assistants to safely and securely interact with your local environment, execute commands, and manage resources — all while giving you full visibility and control right from your menu bar.
 
-![DC Remote MenuBar Screenshot](./header.png)
-
----
-
-## What It Does
-
-DC Remote installs a lightweight native menubar app + a background daemon that registers your Mac as a **remote device** on [mcp.desktopcommander.app](https://mcp.desktopcommander.app). Once running, any Claude Desktop session (or other MCP client) on any machine can connect and:
-
-- **Run terminal commands** on your Mac remotely
-- **Read and edit files** across your filesystem
-- **Manage processes** — start, stop, monitor
-- **Execute shell scripts** and automation workflows
-- **Access your local dev environment** from a remote AI chat
+![Desktop Commander Remote — Dark Mode Spotlight](./assets/dark_spotlight.png)
 
 ---
 
-## Features
+## ✨ Key Features
 
-- **Native macOS menubar app** — lives in your menu bar, zero Dock clutter
-- **One-click start/stop** — toggle the remote daemon from the menubar
-- **Dashboard window** — embedded web UI at `mcp.desktopcommander.app`
-- **Live logs viewer** — see real-time connection and command logs
-- **Device ID management** — copy your unique device ID for pairing
-- **Auto-launch on login** via LaunchAgent (optional)
-- **Signed with Developer ID** — no Gatekeeper warnings
-- **Self-contained DMG installer** — drag-and-drop install, no dependencies
+- **Native macOS Experience** — Built in Swift for Apple Silicon and Intel, featuring a beautiful frosted-glass UI that feels right at home on your Mac
+- **Universal AI Integration** — Works flawlessly with *any* AI agent that supports the Model Context Protocol (MCP). No hardcoded dependencies on specific models
+- **Real-time Visibility** — Instantly check your connection status, device ID, and active streams with a single click
+- **Secure & Controllable** — You hold the keys. Instantly stop, restart, or view logs of your remote connection directly from the menu
+- **One-click Start/Stop** — Toggle the remote daemon from the menubar
+- **Dashboard Window** — Embedded web UI for device management
+- **Auto-launch on Login** — Installs as a macOS LaunchAgent
+- **Signed with Developer ID** — No Gatekeeper warnings
 
 ---
 
-## Quick Install
+## 🚀 Quick Install
 
 ### Option 1 — DMG (recommended)
 
-1. Download the latest DMG from [Releases](https://github.com/samihalawa/desktop-commander-remote/releases/latest)
-2. Open the DMG and drag **DC Remote MenuBar.app** to `/Applications`
+1. Download the latest `.dmg` from the [Releases page](https://github.com/samihalawa/desktop-commander-remote/releases/latest)
+2. Open the DMG and drag **DCRemoteMenuBar.app** to `/Applications`
 3. Launch the app — it appears in your menu bar
 4. Click the monitor icon → **Start** to activate the remote daemon
 
-### Option 2 — npm (daemon only, no menubar UI)
+### Option 2 — npm (daemon only)
 
 ```bash
 npx @wonderwhy-er/desktop-commander setup
@@ -61,9 +49,9 @@ Click the monitor icon in your menu bar → **Start**
 
 The icon turns green when the daemon is online and your Mac is reachable.
 
-### Connect from Claude Desktop
+### Connect your AI agent
 
-Add this to your `claude_desktop_config.json`:
+Add this to your MCP client config:
 
 ```json
 {
@@ -81,9 +69,17 @@ Add this to your `claude_desktop_config.json`:
 
 Get your **Device ID** from the menubar: click the monitor icon → **Copy Device ID**.
 
-### Dashboard
+---
 
-Click **Dashboard** in the menubar to open the web UI at `mcp.desktopcommander.app` — see connected devices, live session logs, and settings.
+## Screenshots
+
+| Dark Mode | Light Mode |
+|---|---|
+| ![Dark Mode Spotlight](./assets/dark_spotlight.png) | ![Light Mode Bokeh](./assets/light_bokeh.png) |
+
+| Status Glow | Developer Action |
+|---|---|
+| ![Status Glow](./assets/status_glow.png) | ![Developer Action](./assets/developer_action.png) |
 
 ---
 
@@ -107,12 +103,12 @@ Click **Dashboard** in the menubar to open the web UI at `mcp.desktopcommander.a
                                 ▲
                                 │ MCP protocol
                 ┌───────────────────────────┐
-                │  Claude Desktop / AI client│
+                │  AI Agent / MCP Client     │
                 │  (any machine, anywhere)   │
                 └───────────────────────────┘
 ```
 
-The **menubar app** (Swift) manages the **Node.js daemon** (`dist/remote-device/device.js`) via `launchctl`. The daemon opens a persistent WebSocket to the relay server. AI clients connect to the relay and issue MCP tool calls that the daemon executes locally on your Mac.
+The **menubar app** (Swift) manages the **Node.js daemon** (`dist/remote-device/device.js`) via `launchctl`. The daemon opens a persistent WebSocket to the relay server. AI agents connect to the relay and issue MCP tool calls that the daemon executes locally on your Mac.
 
 ---
 
@@ -154,40 +150,13 @@ create-dmg \
 
 ---
 
-## Remote Device Daemon
-
-The daemon (`src/remote-device/device.ts`) is the core Node.js process:
-
-- Connects to `mcp.desktopcommander.app` via WebSocket
-- Authenticates with your unique device ID
-- Exposes all Desktop Commander MCP tools remotely
-- Handles reconnection, authentication, and command routing
-
-```bash
-# Run daemon directly (dev mode)
-npm run device:start
-```
-
----
-
-## Contributing
-
-PRs welcome. Please read [CONTRIBUTING.md](./.github/CONTRIBUTING.md) first.
-
-1. Fork the repo
-2. Create a feature branch: `git checkout -b feat/my-feature`
-3. Commit changes: `git commit -m 'feat: add my feature'`
-4. Push and open a PR
-
----
-
 ## FAQ
 
-**Does this work with Claude Desktop?**
-Yes. Add the MCP server config pointing to your device ID and you're done.
+**Is this tied to a specific AI model?**
+No. Desktop Commander Remote is model-agnostic — it works with any AI agent or LLM that supports the Model Context Protocol (MCP). As new models emerge, this app works with them out of the box.
 
 **Is my data secure?**
-Commands are relayed via an encrypted WebSocket. Your device ID is the auth token — keep it private. See [SECURITY.md](./SECURITY.md) and [PRIVACY.md](./PRIVACY.md).
+Commands are relayed via an encrypted WebSocket. Your device ID is the auth token — keep it private.
 
 **Does the daemon run as a background service?**
 Yes — it installs as a macOS LaunchAgent so it survives logout and auto-starts at login.
@@ -197,10 +166,20 @@ The menubar app is macOS-only. The Node daemon (`device.js`) runs on any platfor
 
 ---
 
+## Contributing
+
+PRs welcome. Please read [CONTRIBUTING.md](./.github/CONTRIBUTING.md) first.
+
+1. Fork the repo
+2. Create a feature branch: `git checkout -b feat/my-feature`
+3. Commit and open a PR
+
+---
+
 ## License
 
 MIT — see [LICENSE](./LICENSE)
 
 ---
 
-<!-- SEO keywords: remote mac control, desktop commander mcp, macos remote access AI, MCP server mac, Claude Desktop remote, menubar app mac, AI terminal control, model context protocol remote, desktop automation AI, remote file editing mac, AI mac controller, mcp remote device, desktop commander remote daemon, mac AI agent -->
+<!-- SEO: remote mac control, macos menu bar app, model context protocol, MCP server mac, AI agent local execution, remote desktop AI, macOS automation AI, MCP remote device, desktop commander remote, ai agent mac controller, local AI tool execution, menubar app swift, mac AI integration -->
