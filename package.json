@@ -1,12 +1,16 @@
 {
   "name": "@wonderwhy-er/desktop-commander",
   "version": "0.2.37",
-  "description": "MCP server for terminal operations and file editing",
+  "description": "Remote control your Mac with AI — Desktop Commander MCP server with native macOS menubar app for remote device access via Claude, GPT-4, and other AI agents",
   "mcpName": "io.github.wonderwhy-er/desktop-commander",
   "license": "MIT",
   "author": "Eduards Ruzga",
-  "homepage": "https://github.com/wonderwhy-er/DesktopCommanderMCP",
-  "bugs": "https://github.com/wonderwhy-er/DesktopCommanderMCP/issues",
+  "homepage": "https://github.com/samihalawa/desktop-commander-remote",
+  "bugs": "https://github.com/samihalawa/desktop-commander-remote/issues",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/samihalawa/desktop-commander-remote.git"
+  },
   "type": "module",
   "engines": {
     "node": ">=18.0.0"
@@ -80,7 +84,19 @@
     "text-manipulation",
     "code-modification",
     "surgical-edits",
-    "file-operations"
+    "file-operations",
+    "remote-control",
+    "mac-remote-access",
+    "desktop-commander",
+    "menubar-app",
+    "macos",
+    "remote-device",
+    "ai-agent",
+    "claude-desktop",
+    "gpt-4",
+    "remote-mcp",
+    "desktop-automation",
+    "mac-ai-controller"
   ],
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.9.0",
