@@ -35,6 +35,12 @@ export class RemoteChannel {
     // Track last channel state for debug logging
     private lastChannelState: string | null = null;
 
+    // Backoff state for channel recreation
+    private recreateBackoffMs: number = 1000;
+    private recreateScheduled: boolean = false;
+    private static readonly RECREATE_BACKOFF_MIN = 1000;
+    private static readonly RECREATE_BACKOFF_MAX = 30000;
+
     private _user: User | null = null;
     get user(): User | null { return this._user; }
 
@@ -210,6 +216,8 @@ export class RemoteChannel {
 
                     if (status === 'SUBSCRIBED') {
                         console.log('✅ Channel subscribed');
+                        // Reset backoff on successful subscription
+                        this.recreateBackoffMs = RemoteChannel.RECREATE_BACKOFF_MIN;
                         // Update device status on successful connection
                         if (this.deviceId) {
                             this.setOnlineStatus(this.deviceId, 'online').catch(e => {
@@ -219,12 +227,12 @@ export class RemoteChannel {
                         resolve();
                     } else if (status === 'CHANNEL_ERROR') {
                         // console.error('❌ Channel subscription failed:', err);
-                        this.setOnlineStatus(this.deviceId!, 'offline');
+                        this.markOfflineSafe();
                         captureRemote('remote_channel_subscription_error', { error: err || 'Channel error' }).catch(() => { });
                         reject(err || new Error('Failed to initialize tool call channel subscription'));
                     } else if (status === 'TIMED_OUT') {
                         console.error('⏱️ Channel subscription timed out, Reconnecting...');
-                        this.setOnlineStatus(this.deviceId!, 'offline');
+                        this.markOfflineSafe();
                         captureRemote('remote_channel_subscription_timeout', {}).catch(() => { });
                         reject(new Error('Tool call channel subscription timed out'));
                     }
@@ -248,14 +256,49 @@ export class RemoteChannel {
             this.lastChannelState = state;
         }
 
-        // Aggressive health check: Only 'joined' is considered healthy
-        // Any other state (joining, leaving, closed, errored, etc.) triggers recreation
-        if (state !== 'joined') {
+        // Only recreate on terminal-failure states. Skip transient states
+        // ('joining', 'leaving') which would otherwise trigger spurious recreates
+        // during normal connection transitions or brief network blips.
+        if (state === 'errored' || state === 'closed') {
             captureRemote('remote_channel_state_health', { state });
-
-            console.debug(`[DEBUG] ⚠️ Channel in unhealthy state '${state}' - recreating...`);
-            this.recreateChannel();
+            console.debug(`[DEBUG] ⚠️ Channel in unhealthy state '${state}' - scheduling recreation...`);
+            this.scheduleRecreate();
         }
+    }
+
+    /**
+     * Schedule channel recreation with exponential backoff. Avoids hammering
+     * Supabase during sustained network outages.
+     */
+    private scheduleRecreate(): void {
+        if (this.recreateScheduled) return;
+        this.recreateScheduled = true;
+
+        const delay = this.recreateBackoffMs;
+        console.debug(`[DEBUG] Recreate scheduled in ${delay}ms`);
+        setTimeout(() => {
+            this.recreateScheduled = false;
+            this.recreateChannel();
+        }, delay);
+
+        // Exponential backoff, capped
+        this.recreateBackoffMs = Math.min(
+            this.recreateBackoffMs * 2,
+            RemoteChannel.RECREATE_BACKOFF_MAX
+        );
+    }
+
+    /**
+     * Mark device offline locally without spamming the network during outages.
+     * The remote write is best-effort and silently swallowed on failure.
+     */
+    private markOfflineSafe(): void {
+        if (!this.deviceId) return;
+        if (this.lastDeviceStatus !== 'offline') {
+            console.log('🔌 Device marked as offline');
+            this.lastDeviceStatus = 'offline';
+        }
+        this.setOnlineStatus(this.deviceId, 'offline').catch(() => { /* swallow */ });
     }
 
     /**
@@ -280,10 +323,10 @@ export class RemoteChannel {
         console.debug('[DEBUG] Calling createChannel() for recreation');
         this.createChannel().catch(err => {
             captureRemote('remote_channel_recreate_error', { err });
-            console.debug('[DEBUG] Channel recreation failed:', err.message);
-
-            // TODO: enable only for debug mode
-            // console.error('Failed to recreate channel:', err);
+            console.debug('[DEBUG] Channel recreation failed:', err?.message);
+            // Schedule another attempt with backoff so a sustained outage does
+            // not leave us stuck without a channel.
+            this.scheduleRecreate();
         });
     }
 
