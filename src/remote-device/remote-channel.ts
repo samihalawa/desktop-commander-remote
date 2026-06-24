@@ -305,16 +305,22 @@ export class RemoteChannel {
      * Recreate the channel by destroying old one and creating fresh instance.
      */
     private recreateChannel(): void {
+        void this.recreateChannelInternal();
+    }
+
+    private async recreateChannelInternal(): Promise<void> {
         if (!this.client || !this.user?.id || !this.onToolCall) {
             console.warn('Cannot recreate channel - missing parameters');
             console.debug('[DEBUG] recreateChannel() aborted - missing prerequisites');
             return;
         }
 
+        await this.resetRealtimeTransport();
+
         // Destroy old channel
         if (this.channel) {
             console.debug('[DEBUG] Destroying old channel');
-            this.client.removeChannel(this.channel);
+            await this.client.removeChannel(this.channel);
             this.channel = null;
         }
 
@@ -328,6 +334,41 @@ export class RemoteChannel {
             // not leave us stuck without a channel.
             this.scheduleRecreate();
         });
+    }
+
+    private async resetRealtimeTransport(): Promise<void> {
+        if (!this.client) return;
+
+        try {
+            const { data: sessionData, error: sessionError } = await this.client.auth.getSession();
+            if (sessionError) {
+                console.debug('[DEBUG] Failed to read session before realtime reset:', sessionError.message);
+            } else if (sessionData.session?.refresh_token) {
+                const { error: refreshError } = await this.client.auth.refreshSession(sessionData.session);
+                if (refreshError) {
+                    console.debug('[DEBUG] Session refresh before realtime reset failed:', refreshError.message);
+                } else {
+                    console.debug('[DEBUG] Session refreshed before realtime reset');
+                }
+            }
+        } catch (error: any) {
+            console.debug('[DEBUG] Session refresh before realtime reset threw:', error?.message);
+        }
+
+        try {
+            await this.client.removeAllChannels();
+        } catch (error: any) {
+            console.debug('[DEBUG] removeAllChannels failed during realtime reset:', error?.message);
+        }
+
+        try {
+            this.client.realtime.disconnect();
+            this.client.realtime.connect();
+            this.lastChannelState = null;
+            console.debug('[DEBUG] Realtime transport reset');
+        } catch (error: any) {
+            console.debug('[DEBUG] Realtime transport reset failed:', error?.message);
+        }
     }
 
     async markCallExecuting(callId: string) {

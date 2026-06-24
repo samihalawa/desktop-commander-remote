@@ -66,13 +66,15 @@ export class DeviceAuthenticator {
     private async requestDeviceCode(codeChallenge: string, deviceId?: string): Promise<DeviceAuthResponse> {
         console.log('   - 📡 Requesting device code...');
 
+        const configuredDeviceName = process.env.DC_REMOTE_DEVICE_NAME?.trim() || os.hostname();
+
         const response = await fetch(`${this.baseServerUrl}/device/start`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 client_id: CLIENT_ID,
                 scope: 'mcp:tools',
-                device_name: os.hostname(),
+                device_name: configuredDeviceName,
                 device_type: 'mcp',
                 device_id: deviceId,
                 code_challenge: codeChallenge,
@@ -93,11 +95,16 @@ export class DeviceAuthenticator {
     }
 
     private displayUserInstructions(deviceAuth: DeviceAuthResponse): void {
+        const configuredAccountEmail = process.env.DC_REMOTE_ACCOUNT_EMAIL?.trim();
+
         console.log('📋 Please complete authentication:\n');
         console.log('   1. Open this URL in your browser:');
         console.log(`      ${deviceAuth.verification_uri}\n`);
         console.log('   2. Enter this code when prompted:');
         console.log(`      ${deviceAuth.user_code}\n`);
+        if (configuredAccountEmail) {
+            console.log(`   3. Sign in with: ${configuredAccountEmail}\n`);
+        }
         console.log(`   Code expires in ${Math.floor(deviceAuth.expires_in / 60)} minutes.\n`);
 
         // Try to open browser automatically

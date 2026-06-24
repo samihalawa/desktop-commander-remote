@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { RemoteChannel } from './remote-channel.js';
+import { RemoteChannel, AuthSession } from './remote-channel.js';
 import { DeviceAuthenticator } from './device-authenticator.js';
 import { DesktopCommanderIntegration } from './desktop-commander-integration.js';
 import { fileURLToPath } from 'url';
@@ -11,6 +11,22 @@ import { captureRemote } from '../utils/capture.js';
 
 export interface MCPDeviceOptions {
     persistSession?: boolean;
+    deviceName?: string;
+    accountEmail?: string;
+}
+
+interface PersistedAccountIdentity {
+    userId?: string;
+    preferredEmail?: string;
+    authEmail?: string;
+    providerEmail?: string;
+}
+
+interface PersistedDeviceConfig {
+    deviceId?: string;
+    deviceName?: string | null;
+    session?: AuthSession | null;
+    account?: PersistedAccountIdentity | null;
 }
 
 export class MCPDevice {
@@ -21,6 +37,10 @@ export class MCPDevice {
     private configPath: string;
     private persistSession: boolean;
     private desktop: DesktopCommanderIntegration;
+    private configuredDeviceName?: string;
+    private configuredAccountEmail?: string;
+    private accountIdentity?: PersistedAccountIdentity;
+    private persistedAccountIdentity?: PersistedAccountIdentity;
 
     constructor(options: MCPDeviceOptions = {}) {
         this.baseServerUrl = process.env.MCP_SERVER_URL || 'https://mcp.desktopcommander.app';
@@ -29,6 +49,8 @@ export class MCPDevice {
         this.isShuttingDown = false;
         this.configPath = path.join(os.homedir(), '.desktop-commander-device', 'device.json');
         this.persistSession = options.persistSession || false;
+        this.configuredDeviceName = options.deviceName?.trim() || process.env.DC_REMOTE_DEVICE_NAME?.trim() || undefined;
+        this.configuredAccountEmail = options.accountEmail?.trim() || process.env.DC_REMOTE_ACCOUNT_EMAIL?.trim() || undefined;
 
         // Initialize desktop integration
         this.desktop = new DesktopCommanderIntegration();
@@ -116,7 +138,14 @@ export class MCPDevice {
                     console.log('   - ⚠️ Persisted session invalid:', error.message);
                     session = null;
                 } else {
-                    console.log('   - ✅ Session restored');
+                    const identityCheck = await this.verifyResolvedAccountIdentity('persisted session');
+                    if (!identityCheck.ok) {
+                        console.log(`   - ⚠️ Persisted session belongs to an unexpected account (${identityCheck.reason})`);
+                        await this.clearPersistedSession(identityCheck.clearDeviceId);
+                        session = null;
+                    } else {
+                        console.log('   - ✅ Session restored');
+                    }
                 }
             }
 
@@ -148,11 +177,12 @@ export class MCPDevice {
                 if (error) throw error;
             }
 
+            this.resolveAccountIdentity();
 
             // Force save the current session immediately to ensure it's persisted
             await this.savePersistedConfig();
 
-            const deviceName = os.hostname();
+            const deviceName = this.configuredDeviceName || os.hostname();
 
             // Register as device
             await this.remoteChannel.registerDevice(
@@ -163,7 +193,7 @@ export class MCPDevice {
             );
 
             console.log('✅ Device ready:');
-            console.log(`   - User:         ${this.remoteChannel.user!.email}`);
+            console.log(`   - User:         ${this.formatResolvedUserLabel()}`);
             console.log(`   - Device ID:    ${this.deviceId}`);
             console.log(`   - Device Name:  ${deviceName}`);
 
@@ -186,7 +216,15 @@ export class MCPDevice {
         try {
             console.debug('[DEBUG] Loading persisted config from:', this.configPath);
             const data = await fs.readFile(this.configPath, 'utf8');
-            const config = JSON.parse(data);
+            const config = JSON.parse(data) as PersistedDeviceConfig;
+
+            if (!this.configuredDeviceName && typeof config.deviceName === 'string' && config.deviceName.trim()) {
+                this.configuredDeviceName = config.deviceName.trim();
+            }
+            if (!this.configuredAccountEmail && typeof config.account?.preferredEmail === 'string' && config.account.preferredEmail.trim()) {
+                this.configuredAccountEmail = config.account.preferredEmail.trim();
+            }
+            this.persistedAccountIdentity = config.account || undefined;
 
             this.deviceId = config?.deviceId;
             console.debug('[DEBUG] Loaded device ID:', this.deviceId);
@@ -218,19 +256,23 @@ export class MCPDevice {
             console.debug('[DEBUG] Saving persisted config, persistSession:', this.persistSession);
             const currentSessionStore = await this.remoteChannel.getSession();
             const session = currentSessionStore.data.session;
+            const accountIdentity = this.accountIdentity ?? this.resolveAccountIdentity();
 
-            const config = {
+            const config: PersistedDeviceConfig = {
                 deviceId: this.deviceId,
+                deviceName: this.configuredDeviceName || null,
                 // Only save session if --persist-session flag is set
                 session: (session && this.persistSession) ? {
                     access_token: session.access_token,
                     refresh_token: session.refresh_token
-                } : null
+                } : null,
+                account: accountIdentity
             };
             // Ensure the config directory exists
             console.debug('[DEBUG] Creating config directory:', path.dirname(this.configPath));
             await fs.mkdir(path.dirname(this.configPath), { recursive: true });
             await fs.writeFile(this.configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+            this.persistedAccountIdentity = accountIdentity;
             console.debug('[DEBUG] Config saved to:', this.configPath);
         } catch (error: any) {
             console.error(' - ❌ Failed to save config:', error.message);
@@ -360,6 +402,101 @@ export class MCPDevice {
             await captureRemote('remote_device_shutdown_error', { error });
         }
     }
+
+    private normalizeEmail(email?: string | null): string | undefined {
+        return email?.trim().toLowerCase() || undefined;
+    }
+
+    private getProviderEmail(): string | undefined {
+        const rawEmail = this.remoteChannel.user?.user_metadata?.email;
+        return typeof rawEmail === 'string' ? rawEmail.trim() : undefined;
+    }
+
+    private resolveAccountIdentity(): PersistedAccountIdentity {
+        const authEmail = this.remoteChannel.user?.email?.trim();
+        const providerEmail = this.getProviderEmail();
+        const preferredEmail = this.configuredAccountEmail || providerEmail || authEmail;
+
+        this.accountIdentity = {
+            userId: this.remoteChannel.user?.id,
+            preferredEmail,
+            authEmail,
+            providerEmail
+        };
+
+        if (!this.configuredAccountEmail && preferredEmail) {
+            this.configuredAccountEmail = preferredEmail;
+        }
+
+        return this.accountIdentity;
+    }
+
+    private async verifyResolvedAccountIdentity(source: string): Promise<{ ok: boolean; clearDeviceId: boolean; reason?: string }> {
+        const identity = this.resolveAccountIdentity();
+        const persistedUserId = this.persistedAccountIdentity?.userId;
+
+        if (persistedUserId && identity.userId && persistedUserId !== identity.userId) {
+            await captureRemote('remote_device_account_mismatch', {
+                source,
+                expectedUserId: persistedUserId,
+                actualUserId: identity.userId
+            });
+            return { ok: false, clearDeviceId: true, reason: 'persisted user mismatch' };
+        }
+
+        if (!this.configuredAccountEmail) {
+            return { ok: true, clearDeviceId: false };
+        }
+
+        const expected = this.normalizeEmail(this.configuredAccountEmail);
+        const candidates = [
+            identity.preferredEmail,
+            identity.authEmail,
+            identity.providerEmail
+        ]
+            .map((email) => this.normalizeEmail(email))
+            .filter((email): email is string => !!email);
+
+        if (expected && !candidates.includes(expected)) {
+            await captureRemote('remote_device_account_mismatch', {
+                source,
+                expectedEmail: expected,
+                actualAuthEmail: identity.authEmail,
+                actualProviderEmail: identity.providerEmail
+            });
+            return { ok: false, clearDeviceId: false, reason: `expected ${this.configuredAccountEmail}` };
+        }
+
+        return { ok: true, clearDeviceId: false };
+    }
+
+    private async clearPersistedSession(clearDeviceId: boolean): Promise<void> {
+        if (clearDeviceId) {
+            this.deviceId = undefined;
+            this.persistedAccountIdentity = undefined;
+        }
+
+        const config: PersistedDeviceConfig = {
+            deviceId: clearDeviceId ? undefined : this.deviceId,
+            deviceName: this.configuredDeviceName || null,
+            session: null,
+            account: clearDeviceId ? null : this.persistedAccountIdentity || this.accountIdentity || null
+        };
+
+        await fs.mkdir(path.dirname(this.configPath), { recursive: true });
+        await fs.writeFile(this.configPath, JSON.stringify(config, null, 2), { mode: 0o600 });
+    }
+
+    private formatResolvedUserLabel(): string {
+        const identity = this.accountIdentity ?? this.resolveAccountIdentity();
+        const preferredEmail = identity.preferredEmail || identity.authEmail || 'unknown';
+
+        if (identity.authEmail && identity.authEmail !== preferredEmail) {
+            return `${preferredEmail} (auth: ${identity.authEmail})`;
+        }
+
+        return preferredEmail;
+    }
 }
 
 // Start device if called directly or as a bin command
@@ -376,12 +513,25 @@ const isMainModule = process.argv[1] && (
 if (isMainModule) {
     // Parse command-line arguments
     const args = process.argv.slice(2);
+    const deviceNameArgIndex = args.findIndex((arg) => arg === '--device-name');
+    const deviceName = deviceNameArgIndex >= 0 ? args[deviceNameArgIndex + 1] : undefined;
+    const accountEmailArgIndex = args.findIndex((arg) => arg === '--account-email');
+    const accountEmail = accountEmailArgIndex >= 0 ? args[accountEmailArgIndex + 1] : undefined;
+
     const options = {
-        persistSession: args.includes('--persist-session')
+        persistSession: args.includes('--persist-session'),
+        deviceName,
+        accountEmail
     };
 
     if (options.persistSession) {
         console.log('🔒 Session persistence enabled');
+    }
+    if (options.deviceName) {
+        console.log(`🖥️ Device name override: ${options.deviceName}`);
+    }
+    if (options.accountEmail) {
+        console.log(`👤 Expected account: ${options.accountEmail}`);
     }
 
     const device = new MCPDevice(options);
