@@ -58,3 +58,7 @@ test_files/
 test_fix.js
 test_search.js
 .ripgrep-downloads/
+
+# Menu bar app build artifacts (source is menubar/DCRemoteMenuBar.swift)
+menubar/DCRemoteMenuBar
+menubar/*.bak-*
