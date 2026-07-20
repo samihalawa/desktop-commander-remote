@@ -1,3 +1,5 @@
+[![MseeP.ai Security Assessment Badge](https://mseep.net/pr/samihalawa-desktop-commander-remote-badge.png)](https://mseep.ai/app/samihalawa-desktop-commander-remote)
+
 # Desktop Commander Remote 🖥️⚡
 
 [![Platform](https://img.shields.io/badge/platform-macOS%2012%2B-blue?logo=apple)](https://github.com/samihalawa/desktop-commander-remote/releases)
