@@ -62,3 +62,7 @@ test_search.js
 # Menu bar app build artifacts (source is menubar/DCRemoteMenuBar.swift)
 menubar/DCRemoteMenuBar
 menubar/*.bak-*
+
+# hdiutil temp DMGs (rw.NNNNN.*) — released DMGs in releases/ stay tracked
+releases/rw.*.dmg
+.serena/
