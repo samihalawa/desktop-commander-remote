@@ -2,8 +2,10 @@ import fs from "fs/promises";
 import path from "path";
 import os from 'os';
 import fetch from 'cross-fetch';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { capture } from '../utils/capture.js';
-import { withTimeout } from '../utils/withTimeout.js';
+import { withTimeout, runWithAbortableTimeout } from '../utils/withTimeout.js';
 import { configManager } from '../config-manager.js';
 import { getFileHandler, TextFileHandler } from '../utils/files/index.js';
 import type { ReadOptions, FileResult, PdfPageItem } from '../utils/files/base.js';
@@ -17,6 +19,14 @@ const FILE_OPERATION_TIMEOUTS = {
     URL_FETCH: 30000,          // 30 seconds
     FILE_READ: 30000,          // 30 seconds
 } as const;
+
+// Cap file read operations at 3 minutes. The MCP client's hard per-call limit
+// is ~4 minutes; timing out at 3m lets us abort the underlying fs op and return
+// a useful error (e.g. the cloud-storage guidance in buildPermissionError)
+// BEFORE the client gives up with an opaque "No result received after 4
+// minutes". Paired with runWithAbortableTimeout so the read is actually
+// cancelled (fd/thread released), not just abandoned.
+export const READ_OPERATION_TIMEOUT_MS = 3 * 60 * 1000; // 3 minutes
 
 const FILE_SIZE_LIMITS = {
     LINE_COUNT_LIMIT: 10 * 1024 * 1024,      // 10MB for line counting
@@ -53,6 +63,48 @@ function getFileExtension(filePath: string): string {
 async function getDefaultReadLength(): Promise<number> {
     const config = await configManager.getConfig();
     return config.fileReadLineLimit ?? 1000; // Default to 1000 lines if not set
+}
+
+/**
+ * Returns a helpful error message when a file operation fails with a permission
+ * or timeout error.
+ *
+ * Lists all common causes without path-based detection — the AI receiving this
+ * error should inspect the path and inform the user which cause is most likely
+ * (e.g. cloud storage folder, network drive, system file, locked file, etc.)
+ */
+function buildPermissionError(filePath: string, errCode: string | undefined): Error {
+    const isMac = process.platform === 'darwin';
+    const isTimeout = errCode === 'ETIMEDOUT';
+
+    const lines = [
+        `Cannot read file — ${isTimeout ? 'operation timed out' : 'permission denied'} (${errCode}).`,
+        `Path: ${filePath}`,
+        ``,
+        `[AI: based on the path above, determine which cause is most likely and explain it to the user.]`,
+        ``,
+        `Possible causes and fixes:`,
+        `  1. File is in cloud storage (Google Drive / iCloud / Dropbox / OneDrive) but not downloaded locally.`,
+        `       → Right-click the file and choose "Download Now", "Make Available Offline", or "Keep on This Device".`,
+        `  2. Cloud storage app is not running or not signed in.`,
+        `       → Open your cloud storage app and make sure it is syncing.`,
+        `  3. File is on a network drive or virtual filesystem that is currently unavailable.`,
+        `       → Check that the network share or drive is mounted and accessible.`,
+        `  4. File has restricted permissions (e.g. system file, locked by another process, or chmod 000).`,
+        `       → Check file permissions or close any app that may have the file open.`,
+        `  5. The app does not have permission to access this location (macOS Full Disk Access).`,
+    ];
+
+    if (isMac) {
+        lines.push(`       → Go to System Settings → Privacy & Security → Full Disk Access and enable Claude.`);
+        lines.push(`       → To open that pane directly, run in terminal:`);
+        lines.push(`           open "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"`);
+        lines.push(`         Then find "Claude" in the list and enable the toggle next to it.`);
+    } else {
+        lines.push(`       → Check that the app has permission to access this file location.`);
+    }
+
+    return new Error(lines.join('\n'));
 }
 
 // Initialize allowed directories from configuration
@@ -202,6 +254,36 @@ export async function validatePath(requestedPath: string): Promise<string> {
                 });
                 throw new Error(`Failed to resolve symlink for path: ${absoluteOriginal}. Error: ${err.message}`);
             }
+
+            // SECURITY FIX: When the full path doesn't exist (e.g., writing a new file),
+            // resolve the parent directory to detect symlinks in the path chain.
+            // Without this, an attacker could create a symlink inside an allowed directory
+            // pointing to a restricted location, then write to a non-existent file through
+            // that symlink — bypassing the directory restriction check.
+            try {
+                const parentDir = path.dirname(absoluteOriginal);
+                const resolvedParent = await fs.realpath(parentDir, { encoding: 'utf8' });
+                const basename = path.basename(absoluteOriginal);
+                resolvedRealPath = path.join(resolvedParent, basename);
+            } catch {
+                // Parent also doesn't exist — walk up the tree to find
+                // the deepest existing ancestor and resolve it
+                let current = absoluteOriginal;
+                let remaining: string[] = [];
+                while (true) {
+                    const parent = path.dirname(current);
+                    if (parent === current) break; // reached filesystem root
+                    remaining.unshift(path.basename(current));
+                    current = parent;
+                    try {
+                        const resolvedAncestor = await fs.realpath(current, { encoding: 'utf8' });
+                        resolvedRealPath = path.join(resolvedAncestor, ...remaining);
+                        break;
+                    } catch {
+                        // keep walking up
+                    }
+                }
+            }
         }
 
         const pathForNextCheck = resolvedRealPath ?? absoluteOriginal;
@@ -216,25 +298,25 @@ export async function validatePath(requestedPath: string): Promise<string> {
             throw new Error(`Path not allowed: ${requestedPath}. Must be within one of these directories: ${(await getAllowedDirs()).join(', ')}`);
         }
 
+        // SECURITY: Always return the resolved path (with symlinks resolved) so that
+        // all subsequent file operations (read, write, mkdir, etc.) operate on the
+        // canonical target, not on a symlink that could point outside allowed directories.
+        // pathForNextCheck already holds resolvedRealPath ?? absoluteOriginal from above.
+
         // Check if path exists
         try {
             // fs.stat() will automatically follow symlinks, so we get existence info
-            const stats = await fs.stat(absoluteOriginal);
-            // If path exists, resolve any symlinks
-            if (resolvedRealPath) {
-                return resolvedRealPath;
-            }
-
-            return absoluteOriginal;
+            await fs.stat(pathForNextCheck);
+            return pathForNextCheck;
         } catch (error) {
             // Path doesn't exist - validate parent directories
-            if (await validateParentDirectories(absoluteOriginal)) {
-                // Return the path if a valid parent exists
+            if (await validateParentDirectories(pathForNextCheck)) {
+                // Return the resolved path if a valid parent exists
                 // This will be used for folder creation and many other file operations
-                return absoluteOriginal;
+                return pathForNextCheck;
             }
-            // If no valid parent found, return the absolute path anyway
-            return absoluteOriginal;
+            // If no valid parent found, return the resolved path anyway
+            return pathForNextCheck;
         }
     };
 
@@ -369,6 +451,40 @@ export async function readFileFromDisk(
     // Get file extension for telemetry
     const fileExtension = getFileExtension(validPath);
 
+    // Check if path is a directory — return listing instead of EISDIR error
+    try {
+        const stats = await fs.stat(validPath);
+        if (stats.isDirectory()) {
+            const dirListOp = async () => {
+                const entries = await listDirectory(validPath);
+                const listing = entries.join('\n');
+                return {
+                    content: `This is a directory, not a file. Use the list_directory tool instead of read_file for directories.\n\n${listing}`,
+                    mimeType: 'text/plain',
+                    metadata: { isImage: false, isDirectory: true }
+                } as FileResult;
+            };
+            const dirResult = await withTimeout(
+                dirListOp(),
+                FILE_OPERATION_TIMEOUTS.FILE_READ,
+                'Directory listing fallback',
+                null
+            );
+            if (dirResult === null) {
+                throw new Error(`Directory listing timed out for: ${filePath}`);
+            }
+            return dirResult;
+        }
+    } catch (error) {
+        // If stat itself failed, fall through to the read path which will produce a proper error.
+        // But if this was a directory-listing error, re-throw — don't let it fall into the file-read path.
+        const err = error as NodeJS.ErrnoException;
+        if (err.message?.includes('Directory listing') || err.message?.includes('list_directory')) {
+            throw error;
+        }
+        // stat() failed (e.g. ENOENT) — fall through to the read path below
+    }
+
     // Check file size before attempting to read
     try {
         const stats = await fs.stat(validPath);
@@ -387,8 +503,9 @@ export async function readFileFromDisk(
         // If we can't stat the file, continue anyway and let the read operation handle errors
     }
 
-    // Use withTimeout to handle potential hangs
-    const readOperation = async () => {
+    // Read under an abortable timeout so a hung/stalled read is cancelled
+    // (fd/thread freed) rather than leaked until the OS call returns.
+    const readOperation = async (signal: AbortSignal) => {
         // Get appropriate handler for this file type (async - includes binary detection)
         const handler = await getFileHandler(validPath);
 
@@ -398,7 +515,8 @@ export async function readFileFromDisk(
             length,
             sheet,
             range,
-            includeStatusMessage: true
+            includeStatusMessage: true,
+            signal
         });
 
         // Return with content as string
@@ -421,13 +539,23 @@ export async function readFileFromDisk(
         };
     };
 
-    // Execute with timeout
-    const result = await withTimeout(
-        readOperation(),
-        FILE_OPERATION_TIMEOUTS.FILE_READ,
-        `Read file operation for ${filePath}`,
-        null
-    );
+    // Execute with a 3-minute, cancellable timeout
+    let result;
+    try {
+        result = await runWithAbortableTimeout(
+            (signal) => readOperation(signal),
+            READ_OPERATION_TIMEOUT_MS,
+            `Read file operation for ${filePath}`
+        );
+    } catch (error) {
+        const err = error as NodeJS.ErrnoException;
+        // runWithAbortableTimeout rejects with an Error whose .code is 'ETIMEDOUT'
+        // on timeout; fs rejects with EPERM/EACCES. Map all to the guidance error.
+        if (err.code === 'EPERM' || err.code === 'EACCES' || err.code === 'ETIMEDOUT') {
+            throw buildPermissionError(filePath, err.code);
+        }
+        throw error;
+    }
 
     if (result == null) {
         // Handles the impossible case where withTimeout resolves to null instead of throwing
@@ -482,8 +610,14 @@ export async function readFileInternal(filePath: string, offset: number = 0, len
     // preserve exact file content including original line endings.
     // We cannot use readline-based reading as it strips line endings.
 
-    // Read entire file content preserving line endings
-    const content = await fs.readFile(validPath, 'utf8');
+    // Read entire file content preserving line endings, under a 3-minute,
+    // cancellable timeout so an edit on a stalled/cloud path can't hang forever
+    // (previously this read had no timeout at all).
+    const content = await runWithAbortableTimeout(
+        (signal) => fs.readFile(validPath, { encoding: 'utf8', signal }),
+        READ_OPERATION_TIMEOUT_MS,
+        `Internal read for ${filePath}`
+    );
 
     // If we need to apply offset/length, do it while preserving line endings
     if (offset === 0 && length >= Number.MAX_SAFE_INTEGER) {
@@ -596,9 +730,16 @@ export async function listDirectory(dirPath: string, depth: number = 2): Promise
         try {
             entries = await fs.readdir(currentPath, { withFileTypes: true });
         } catch (error) {
-            // If we can't read this directory (permission denied), show as denied
+            const err = error as NodeJS.ErrnoException;
             const displayPath = relativePath || path.basename(currentPath);
-            results.push(`[DENIED] ${displayPath}`);
+            // Distinguish "not found" from "permission denied" so AI and UI get accurate info.
+            if (err.code === 'ENOENT') {
+                results.push(`[NOT_FOUND] ${displayPath} — path does not exist`);
+            } else if (err.code === 'EPERM' || err.code === 'EACCES' || err.code === 'ETIMEDOUT') {
+                results.push(`[DENIED] ${displayPath} — not accessible (permission denied, cloud-only file, or Full Disk Access not granted)`);
+            } else {
+                results.push(`[DENIED] ${displayPath}`);
+            }
             return;
         }
 
@@ -916,4 +1057,54 @@ export async function writePdf(
     } else {
         throw new Error('Invalid content type for writePdf. Expected string (markdown) or array of operations.');
     }
+}
+
+const execFileAsync = promisify(execFile);
+type DefaultEditorMetadata = { defaultEditorName?: string; defaultEditorPath?: string };
+type DefaultEditorCacheEntry = { metadata: DefaultEditorMetadata; expiresAt?: number };
+const DEFAULT_EDITOR_NEGATIVE_CACHE_MS = 5 * 60 * 1000;
+const defaultEditorCache = new Map<string, DefaultEditorCacheEntry>();
+
+function escapeAppleScriptString(value: string): string {
+    return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
+
+export async function getDefaultEditorMetadata(filePath: string): Promise<DefaultEditorMetadata> {
+    if (os.platform() !== 'darwin') {
+        return {};
+    }
+
+    let cacheKey = '';
+    try {
+        const extension = path.extname(filePath).toLowerCase();
+        cacheKey = extension || path.basename(filePath).toLowerCase();
+        const cached = defaultEditorCache.get(cacheKey);
+        if (cached) {
+            if (!cached.expiresAt || cached.expiresAt > Date.now()) {
+                return cached.metadata;
+            }
+            defaultEditorCache.delete(cacheKey);
+        }
+
+        const script = `set appAlias to default application of (info for POSIX file "${escapeAppleScriptString(filePath)}")\nreturn (name of (info for appAlias)) & linefeed & POSIX path of appAlias`;
+        const { stdout } = await execFileAsync('osascript', ['-e', script], { timeout: 12000 });
+        const lines = stdout.split('\n').map((line) => line.trim()).filter(Boolean);
+        const defaultEditorName = lines[lines.length - 2]?.replace(/\.app$/i, '') ?? '';
+        const defaultEditorPath = lines[lines.length - 1] ?? '';
+
+        if (defaultEditorName && defaultEditorPath.startsWith('/')) {
+            const metadata = { defaultEditorName, defaultEditorPath };
+            defaultEditorCache.set(cacheKey, { metadata });
+            return metadata;
+        }
+
+        defaultEditorCache.set(cacheKey, { metadata: {}, expiresAt: Date.now() + DEFAULT_EDITOR_NEGATIVE_CACHE_MS });
+    } catch {
+        if (cacheKey) {
+            defaultEditorCache.set(cacheKey, { metadata: {}, expiresAt: Date.now() + DEFAULT_EDITOR_NEGATIVE_CACHE_MS });
+        }
+        // Generic UI fallback is good enough if detection fails.
+    }
+
+    return {};
 }

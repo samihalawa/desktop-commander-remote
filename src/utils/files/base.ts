@@ -88,6 +88,9 @@ export interface ReadOptions {
 
     /** Whether to include status messages (default: true) */
     includeStatusMessage?: boolean;
+
+    /** Optional AbortSignal to cancel an in-flight read (frees fd/thread on timeout). */
+    signal?: AbortSignal;
 }
 
 /**
@@ -110,6 +113,9 @@ export interface FileResult {
 export interface FileMetadata {
     /** For images */
     isImage?: boolean;
+
+    /** For directories (read_file fallback to listDirectory) */
+    isDirectory?: boolean;
 
     /** For binary files */
     isBinary?: boolean;

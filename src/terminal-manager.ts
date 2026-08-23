@@ -6,13 +6,56 @@ import { configManager } from './config-manager.js';
 import {capture} from "./utils/capture.js";
 import { analyzeProcessState } from './utils/process-detection.js';
 
+/**
+ * Standard Windows PATHEXT value, used to repair a corrupted PATHEXT before
+ * spawning child shells.
+ *
+ * On some Windows Claude Desktop / DXT launches the server process inherits a
+ * broken PATHEXT (observed as ".CPL" only). Because we build the child env from
+ * { ...process.env }, that broken value would propagate into every spawned
+ * shell, stripping ".EXE" and breaking resolution of git / node / python / rg /
+ * etc. (and even full-path .exe invocations under PowerShell). See issue #481.
+ */
+const STANDARD_PATHEXT = '.COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;.MSC';
+
+/**
+ * Return a healthy PATHEXT for spawned Windows shells.
+ * - Unset           -> use the standard list.
+ * - Missing ".EXE"  -> corrupted; merge the standard list with whatever was
+ *                      present (preserves any extra extensions, order-stable).
+ * - Otherwise       -> leave the inherited value untouched.
+ */
+function getRepairedPathExt(): string {
+  const current = process.env.PATHEXT;
+  if (!current) return STANDARD_PATHEXT;
+  const exts = current.split(';').map(e => e.trim().toUpperCase()).filter(Boolean);
+  if (!exts.includes('.EXE')) {
+    return [...new Set([...STANDARD_PATHEXT.split(';'), ...exts])].join(';');
+  }
+  return current;
+}
+
 interface CompletedSession {
   pid: number;
   outputLines: string[];       // Line-based buffer (consistent with active sessions)
   exitCode: number | null;
   startTime: Date;
   endTime: Date;
+  evictedLines: number;        // Carried over from the active session (see TerminalSession)
+  evictedChars: number;
 }
+
+/**
+ * Output buffering caps. Without a cap, a process emitting enough output makes
+ * string concatenation throw "RangeError: Invalid string length" at V8's max
+ * string size (~536M chars) inside a stdout 'data' handler — an uncaught
+ * exception that kills the whole server (index.ts exits on uncaughtException).
+ * The cap also bounds the join() cost in snapshot reads and the periodic
+ * process-state scan, both of which are O(total output).
+ */
+export const MAX_BUFFERED_OUTPUT_CHARS = 50 * 1024 * 1024;  // per session; oldest lines evicted first
+const MAX_LINE_CHARS = 1024 * 1024;                  // force-split longer lines so eviction can work
+const MAX_WAIT_OUTPUT_CHARS = 2 * 1024 * 1024;       // start_process wait buffer (prompt/state detection)
 
 // Result type for paginated output reading
 export interface PaginatedOutputResult {
@@ -24,6 +67,7 @@ export interface PaginatedOutputResult {
   isComplete: boolean;         // Whether process has finished
   exitCode?: number | null;    // Exit code if completed
   runtimeMs?: number;          // Runtime in milliseconds (for completed processes)
+  evictedLines?: number;       // Lines dropped by the buffer cap; when > 0, line numbers are relative to the retained buffer
 }
 
 /**
@@ -33,6 +77,9 @@ interface ShellSpawnConfig {
   executable: string;
   args: string[];
   useShellOption: string | boolean;
+  // When true, pass args verbatim on Windows (see executeCommand). Only cmd.exe
+  // needs this; its quote parsing conflicts with libuv's default \" escaping.
+  windowsVerbatim?: boolean;
 }
 
 /**
@@ -74,6 +121,7 @@ function getShellSpawnArgs(shellPath: string, command: string): ShellSpawnConfig
     return { 
       executable: shellPath, 
       args: ['/c', command],
+      windowsVerbatim: true,
       useShellOption: false 
     };
   }
@@ -160,9 +208,10 @@ export class TerminalManager {
         env: {
           ...process.env,
           TERM: 'xterm-256color'  // Better terminal compatibility
-        }
+        },
+        windowsHide: true  // Prevent visible console windows on Windows
       };
-      
+
       // Add shell option if needed (for unknown shells)
       if (spawnConfig.useShellOption) {
         spawnOptions.shell = spawnConfig.useShellOption;
@@ -179,8 +228,28 @@ export class TerminalManager {
         env: {
           ...process.env,
           TERM: 'xterm-256color'
-        }
+        },
+        windowsHide: true  // Prevent visible console windows on Windows
       };
+    }
+
+    // Repair PATHEXT on Windows before spawning. On some Windows DXT launches
+    // the server process inherits a corrupted PATHEXT (e.g. ".CPL"), which we
+    // would otherwise propagate via { ...process.env } and break command
+    // resolution (git, node, python, rg, ...) in the spawned shell. See #481.
+    if (process.platform === 'win32' && spawnOptions.env) {
+      spawnOptions.env.PATHEXT = getRepairedPathExt();
+    }
+
+    // On Windows, when we invoke cmd.exe directly and pass the user's command as a
+    // single argument, Node/libuv applies MSVCRT-style quoting that escapes embedded
+    // double quotes as \" . cmd.exe does not understand that escaping, so any command
+    // containing quotes (e.g. a quoted path with spaces like "C:\Program Files\app.exe")
+    // is corrupted before the shell ever parses it. Passing arguments verbatim lets
+    // cmd handle its own quoting. Scoped to shells that set windowsVerbatim (cmd only)
+    // because PowerShell/pwsh have different quote rules and must NOT use verbatim.
+    if (process.platform === 'win32' && spawnConfig.windowsVerbatim) {
+      spawnOptions.windowsVerbatimArguments = true;
     }
 
     // Spawn the process with appropriate arguments
@@ -203,7 +272,10 @@ export class TerminalManager {
       outputLines: [],           // Line-based buffer
       lastReadIndex: 0,          // Track where "new" output starts
       isBlocked: false,
-      startTime: new Date()
+      startTime: new Date(),
+      bufferedChars: 0,
+      evictedLines: 0,
+      evictedChars: 0
     };
 
     this.sessions.set(childProcess.pid, session);
@@ -252,7 +324,14 @@ export class TerminalManager {
         if (!firstOutputTime) firstOutputTime = now;
         lastOutputTime = now;
 
-        output += text;
+        // `output` only feeds the wait-phase result and prompt/state detection,
+        // so stop growing it once resolved and keep only a bounded tail.
+        if (!resolved) {
+          output += text;
+          if (output.length > MAX_WAIT_OUTPUT_CHARS) {
+            output = output.slice(-Math.floor(MAX_WAIT_OUTPUT_CHARS / 2));
+          }
+        }
         // Append to line-based buffer
         this.appendToLineBuffer(session, text);
 
@@ -291,7 +370,12 @@ export class TerminalManager {
         if (!firstOutputTime) firstOutputTime = now;
         lastOutputTime = now;
 
-        output += text;
+        if (!resolved) {
+          output += text;
+          if (output.length > MAX_WAIT_OUTPUT_CHARS) {
+            output = output.slice(-Math.floor(MAX_WAIT_OUTPUT_CHARS / 2));
+          }
+        }
         // Append to line-based buffer
         this.appendToLineBuffer(session, text);
 
@@ -342,7 +426,9 @@ export class TerminalManager {
             outputLines: [...session.outputLines], // Copy line buffer
             exitCode: code,
             startTime: session.startTime,
-            endTime: new Date()
+            endTime: new Date(),
+            evictedLines: session.evictedLines,
+            evictedChars: session.evictedChars
           });
 
           // Keep only last 100 completed sessions
@@ -369,15 +455,15 @@ export class TerminalManager {
    */
   private appendToLineBuffer(session: TerminalSession, text: string): void {
     if (!text) return;
-    
+
     // Split text into lines, keeping track of whether text ends with newline
     const lines = text.split('\n');
-    
+
     for (let i = 0; i < lines.length; i++) {
       const line = lines[i];
       const isLastFragment = i === lines.length - 1;
       const endsWithNewline = text.endsWith('\n');
-      
+
       if (session.outputLines.length === 0) {
         // First line ever
         session.outputLines.push(line);
@@ -388,6 +474,33 @@ export class TerminalManager {
         // Subsequent lines - add as new lines
         session.outputLines.push(line);
       }
+    }
+    // Appended text contributes exactly its length to the joined buffer
+    // (its newlines become the join separators).
+    session.bufferedChars += text.length;
+
+    // A process printing without newlines grows a single line forever, which
+    // eviction can't bound — force-split so no line exceeds MAX_LINE_CHARS.
+    // Each inserted break adds one separator to the joined length.
+    let lastIndex = session.outputLines.length - 1;
+    while (session.outputLines[lastIndex].length > MAX_LINE_CHARS) {
+      const overlong = session.outputLines[lastIndex];
+      session.outputLines[lastIndex] = overlong.slice(0, MAX_LINE_CHARS);
+      session.outputLines.push(overlong.slice(MAX_LINE_CHARS));
+      session.bufferedChars += 1;
+      lastIndex++;
+    }
+
+    // Enforce the per-session cap by evicting the oldest lines. Keeps the
+    // buffer far below V8's max string length so concatenation and join()
+    // can never throw "Invalid string length" and kill the server.
+    while (session.bufferedChars > MAX_BUFFERED_OUTPUT_CHARS && session.outputLines.length > 1) {
+      const dropped = session.outputLines.shift()!;
+      const droppedJoinedChars = dropped.length + 1; // +1 for its join separator
+      session.bufferedChars -= droppedJoinedChars;
+      session.evictedChars += droppedJoinedChars;
+      session.evictedLines++;
+      if (session.lastReadIndex > 0) session.lastReadIndex--;
     }
   }
 
@@ -402,7 +515,7 @@ export class TerminalManager {
     // First check active sessions
     const session = this.sessions.get(pid);
     if (session) {
-      return this.readFromLineBuffer(
+      const result = this.readFromLineBuffer(
         session.outputLines,
         offset,
         length,
@@ -411,13 +524,15 @@ export class TerminalManager {
         false,
         undefined
       );
+      result.evictedLines = session.evictedLines;
+      return result;
     }
 
     // Then check completed sessions
     const completedSession = this.completedSessions.get(pid);
     if (completedSession) {
       const runtimeMs = completedSession.endTime.getTime() - completedSession.startTime.getTime();
-      return this.readFromLineBuffer(
+      const result = this.readFromLineBuffer(
         completedSession.outputLines,
         offset,
         length,
@@ -427,6 +542,8 @@ export class TerminalManager {
         completedSession.exitCode,
         runtimeMs
       );
+      result.evictedLines = completedSession.evictedLines;
+      return result;
     }
 
     return null;
@@ -543,8 +660,11 @@ export class TerminalManager {
     if (session) {
       const fullOutput = session.outputLines.join('\n');
       return {
-        totalChars: fullOutput.length,
-        lineCount: session.outputLines.length
+        // Absolute since process start (includes evicted output), so the
+        // offset stays valid even if the cap evicts lines between
+        // snapshot and read.
+        totalChars: session.evictedChars + fullOutput.length,
+        lineCount: session.evictedLines + session.outputLines.length
       };
     }
     return null;
@@ -559,24 +679,30 @@ export class TerminalManager {
     // Check active session first
     const session = this.sessions.get(pid);
     if (session) {
-      const fullOutput = session.outputLines.join('\n');
-      if (fullOutput.length <= snapshot.totalChars) {
-        return ''; // No new output
-      }
-      return fullOutput.substring(snapshot.totalChars);
+      return TerminalManager.outputSinceSnapshot(session.outputLines, session.evictedChars, snapshot.totalChars);
     }
-    
+
     // Fallback to completed sessions - process may have finished between snapshot and poll
     const completedSession = this.completedSessions.get(pid);
     if (completedSession) {
-      const fullOutput = completedSession.outputLines.join('\n');
-      if (fullOutput.length <= snapshot.totalChars) {
-        return ''; // No new output
-      }
-      return fullOutput.substring(snapshot.totalChars);
+      return TerminalManager.outputSinceSnapshot(completedSession.outputLines, completedSession.evictedChars, snapshot.totalChars);
     }
-    
+
     return null;
+  }
+
+  /**
+   * New output since a snapshot, in absolute (since process start) offsets.
+   * If eviction dropped part of the unseen output, returns what the buffer
+   * still holds — the oldest unseen chars are lost to the cap.
+   */
+  private static outputSinceSnapshot(outputLines: string[], evictedChars: number, snapshotTotalChars: number): string {
+    const fullOutput = outputLines.join('\n');
+    const newChars = evictedChars + fullOutput.length - snapshotTotalChars;
+    if (newChars <= 0) {
+      return ''; // No new output
+    }
+    return fullOutput.substring(Math.max(0, fullOutput.length - newChars));
   }
 
     /**

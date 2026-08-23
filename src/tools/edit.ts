@@ -15,10 +15,10 @@
  * 3. Unify the editRange() signature to handle both text search/replace and structured edits
  */
 
-import { readFile, writeFile, readFileInternal, validatePath } from './filesystem.js';
+import { getDefaultEditorMetadata, readFile, writeFile, readFileInternal, validatePath } from './filesystem.js';
 import fs from 'fs/promises';
 import { ServerResult } from '../types.js';
-import { recursiveFuzzyIndexOf, getSimilarityRatio } from './fuzzySearch.js';
+import { runFuzzySearchInWorker, getSimilarityRatio } from './fuzzySearch.js';
 import { capture } from '../utils/capture.js';
 import { createErrorResponse } from '../error-handlers.js';
 import { EditBlockArgsSchema } from "./schemas.js";
@@ -26,6 +26,8 @@ import path from 'path';
 import { detectLineEnding, normalizeLineEndings } from '../utils/lineEndingHandler.js';
 import { configManager } from '../config-manager.js';
 import { fuzzySearchLogger, type FuzzySearchLogEntry } from '../utils/fuzzySearchLogger.js';
+import { resolvePreviewFileType } from '../ui/file-preview/shared/preview-file-types.js';
+import { resolveAbsolutePath } from '../handlers/filesystem-handlers.js';
 
 interface SearchReplace {
     search: string;
@@ -111,7 +113,7 @@ function getCharacterCodeData(expected: string, actual: string): {
     };
 }
 
-export async function performSearchReplace(filePath: string, block: SearchReplace, expectedReplacements: number = 1): Promise<ServerResult> {
+export async function performSearchReplace(filePath: string, block: SearchReplace, expectedReplacements: number = 1, origin?: 'ui' | 'llm'): Promise<ServerResult> {
     // Get file extension for telemetry using path module
     const fileExtension = path.extname(filePath).toLowerCase();
     
@@ -200,11 +202,39 @@ RECOMMENDATION: For large search/replace operations, consider breaking them into
         
         await writeFile(filePath, newContent);
         capture('server_edit_block_exact_success', {fileExtension: fileExtension, expectedReplacements, hasWarning: warningMessage !== ""});
+        const resolvedEditPath = resolveAbsolutePath(filePath);
+
+        // Show a partial preview centered on the edited area
+        const newLines = newContent.split('\n');
+        const totalLines = newLines.length;
+        const changePos = content.indexOf(normalizedSearch);
+        const changeStartLine = changePos >= 0 ? newContent.substring(0, changePos).split('\n').length - 1 : 0;
+        const changeLineCount = block.replace.split('\n').length;
+        const contextLines = 10;
+        const previewStart = Math.max(0, changeStartLine - contextLines);
+        const previewEnd = Math.min(totalLines, changeStartLine + changeLineCount + contextLines);
+        const previewContent = newLines.slice(previewStart, previewEnd).join('\n');
+        const previewLineCount = previewEnd - previewStart;
+        const remaining = totalLines - previewEnd;
+        const statusLine = `[Reading ${previewLineCount} lines from ${previewStart === 0 ? 'start' : `line ${previewStart}`} (total: ${totalLines} lines, ${remaining} remaining)]\n\n`;
+
         return {
-            content: [{ 
-                type: "text", 
-                text: `Successfully applied ${expectedReplacements} edit${expectedReplacements > 1 ? 's' : ''} to ${filePath}${warningMessage}` 
+            content: [{
+                type: "text",
+                text: `${statusLine}${previewContent}`
             }],
+            // structuredContent only travels on widget-initiated calls: it is the
+            // widget's save-success signal (assertSuccessfulEditBlockResult) and
+            // metadata source. LLM-facing responses don't need it — nothing there
+            // consumes it, and the widget re-reads by path instead.
+            ...(origin === 'ui' ? {
+                structuredContent: {
+                    fileName: path.basename(resolvedEditPath),
+                    filePath: resolvedEditPath,
+                    fileType: resolvePreviewFileType(resolvedEditPath),
+                    ...await getDefaultEditorMetadata(resolvedEditPath),
+                },
+            } : {}),
         };
     }
     
@@ -226,9 +256,10 @@ RECOMMENDATION: For large search/replace operations, consider breaking them into
     if (count === 0) {
         // Track fuzzy search time
         const startTime = performance.now();
-        
-        // Perform fuzzy search
-        const fuzzyResult = recursiveFuzzyIndexOf(content, block.search);
+
+        // Perform fuzzy search in a worker thread so the main event loop stays
+        // responsive to pings and parallel tool calls during the scan
+        const fuzzyResult = await runFuzzySearchInWorker(content, block.search);
         const similarity = getSimilarityRatio(block.search, fuzzyResult.value);
         
         // Calculate execution time in milliseconds
@@ -405,11 +436,20 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
             try {
                 // parsed.range is guaranteed non-empty string by hasRange check above
                 await handler.editRange!(validatedPath!, parsed.range!, content, parsed.options);
+                const resolvedRangePath = resolveAbsolutePath(parsed.file_path);
                 return {
                     content: [{
                         type: "text",
                         text: `Successfully updated range ${parsed.range} in ${parsed.file_path}`
                     }],
+                    ...(parsed.origin === 'ui' ? {
+                        structuredContent: {
+                            fileName: path.basename(resolvedRangePath),
+                            filePath: resolvedRangePath,
+                            fileType: resolvePreviewFileType(resolvedRangePath),
+                            ...await getDefaultEditorMetadata(resolvedRangePath),
+                        },
+                    } : {}),
                 };
             } catch (error) {
                 const errorMessage = error instanceof Error ? error.message : String(error);
@@ -437,11 +477,20 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
             });
 
             if (result.success) {
+                const resolvedEditRangePath = resolveAbsolutePath(parsed.file_path);
                 return {
                     content: [{
                         type: "text",
                         text: `Successfully applied ${result.editsApplied} edit(s) to ${parsed.file_path}`
                     }],
+                    ...(parsed.origin === 'ui' ? {
+                        structuredContent: {
+                            fileName: path.basename(resolvedEditRangePath),
+                            filePath: resolvedEditRangePath,
+                            fileType: resolvePreviewFileType(resolvedEditRangePath),
+                            ...await getDefaultEditorMetadata(resolvedEditRangePath),
+                        },
+                    } : {}),
                 };
             }
 
@@ -456,5 +505,5 @@ export async function handleEditBlock(args: unknown): Promise<ServerResult> {
     return performSearchReplace(parsed.file_path, {
         search: parsed.old_string,
         replace: parsed.new_string
-    }, parsed.expected_replacements);
+    }, parsed.expected_replacements, parsed.origin);
 }

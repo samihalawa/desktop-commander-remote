@@ -1,3 +1,4 @@
+import path from 'path';
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
     CallToolRequestSchema,
@@ -50,7 +51,13 @@ import {
     GetPromptsArgsSchema,
     GetRecentToolCallsArgsSchema,
     WritePdfArgsSchema,
+    toolArgSchemas,
 } from './tools/schemas.js';
+import {
+    detectUnsupportedParams,
+    getSupportedParams,
+    buildUnsupportedParamsWarning,
+} from './utils/unsupportedParams.js';
 import { getConfig, setConfigValue } from './tools/config.js';
 import { getUsageStats } from './tools/usage.js';
 import { giveFeedbackToDesktopCommander } from './tools/feedback.js';
@@ -59,17 +66,18 @@ import { trackToolCall } from './utils/trackTools.js';
 import { usageTracker } from './utils/usageTracker.js';
 import { processDockerPrompt } from './utils/dockerPrompt.js';
 import { toolHistory } from './utils/toolHistory.js';
-import { handleWelcomePageOnboarding } from './utils/welcome-onboarding.js';
+import { handleWelcomePageOnboarding, skipWelcomePageOnboarding } from './utils/welcome-onboarding.js';
 
 import { VERSION } from './version.js';
-import { capture, capture_call_tool } from "./utils/capture.js";
+import { capture, capture_call_tool, runInUiOriginCallContext } from "./utils/capture.js";
 import { logToStderr, logger } from './utils/logger.js';
 import {
     buildUiToolMeta,
     CONFIG_EDITOR_RESOURCE_URI,
-    FILE_PREVIEW_RESOURCE_URI
+    FILE_PREVIEW_RESOURCE_URI,
 } from './ui/contracts.js';
 import { listUiResources, readUiResource } from './ui/resources.js';
+import { shouldShowMcpUiPreviews } from './utils/mcp-ui-ab-test.js';
 
 // Store startup messages to send after initialization
 const deferredMessages: Array<{ level: string, message: string }> = [];
@@ -130,6 +138,48 @@ server.setRequestHandler(ListPromptsRequestSchema, async () => {
 // Store current client info (simple variable)
 let currentClient = { name: 'uninitialized', version: 'uninitialized' };
 
+// Tracks whether the in-flight tool call originated from a remote device.
+// Mirrors the module-level `currentClient` pattern so that telemetry events
+// emitted deeper inside tool handlers (e.g. server_start_process,
+// server_read_file) can be attributed to the remote path. The CallTool
+// handler sets this on every call (true when _meta.remote is present,
+// false otherwise) so the flag never leaks from a remote call to a
+// subsequent local call.
+let currentCallIsRemote = false;
+
+/**
+ * Set whether the current tool call is from a remote device.
+ * Called once per tool call by the CallTool handler.
+ */
+function setCurrentCallIsRemote(isRemote: boolean) {
+    currentCallIsRemote = isRemote;
+}
+
+// The remote caller's client for the in-flight tool call (e.g. openai-mcp,
+// claude-ai). Set per CallTool when the call is remote; null for local calls.
+// Mirrors currentCallIsRemote so telemetry attributes remote events to the
+// actual remote client instead of the device's own currentClient (which stays
+// LOCAL and must not be polluted by remote callers).
+let currentRemoteClient: { name?: string; version?: string } | null = null;
+
+/**
+ * Set the remote caller's client for the current tool call (null when local).
+ * Called once per tool call by the CallTool handler.
+ */
+function setCurrentRemoteClient(clientInfo: { name?: string; version?: string } | null) {
+    currentRemoteClient = clientInfo;
+}
+
+/**
+ * True when this server instance is serving remote services rather than a
+ * local MCP client. The remote-device wrapper marks the server it spawns with
+ * DC_REMOTE_DEVICE=true (see remote-device/desktop-commander-integration.ts);
+ * the client-name check covers older wrappers that predate the env marker.
+ */
+function isRemoteClientContext(clientName?: string): boolean {
+    return process.env.DC_REMOTE_DEVICE === 'true' || clientName === 'desktop-commander-client';
+}
+
 /**
  * Unified way to update client information
  */
@@ -163,14 +213,41 @@ server.setRequestHandler(InitializeRequestSchema, async (request: InitializeRequ
         if (clientInfo) {
             await updateCurrentClient(clientInfo);
 
-            // Welcome page for new claude-ai users (A/B test controlled)
-            // Also matches 'local-agent-mode-*' which is how Claude.ai connectors report themselves
-            if ((currentClient.name === 'claude-ai' || currentClient.name?.startsWith('local-agent-mode')) && !(global as any).disableOnboarding) {
-                await handleWelcomePageOnboarding();
+            // Welcome page for new users (A/B test controlled) — all clients except
+            // the Desktop Commander app and remote contexts. Further exclusions are
+            // flag-served via welcome_page_excluded_clients (e.g. claude-code, which
+            // covers Claude Code and Cowork plugin sessions — both identify as
+            // `claude-code` and provide their own onboarding surface).
+            const isWelcomePageEligibleClient = currentClient.name !== 'desktop-commander-app'
+                && currentClient.name !== 'desktop-commander'
+                && !isRemoteClientContext(currentClient.name)
+                && !(global as any).disableOnboarding;
+
+            if (isWelcomePageEligibleClient) {
+                await handleWelcomePageOnboarding(currentClient.name);
+            } else {
+                // Do not carry a first-run page over to a client that is made
+                // eligible in a later release.
+                await skipWelcomePageOnboarding();
             }
         }
 
-        capture('run_server_mcp_initialized');
+        // Raw host environment signals (no PII, undefined when absent). Some
+        // hosts share a clientInfo name — Claude Code CLI, Claude Code inside
+        // the Claude Desktop app, and Cowork all report 'claude-code' — and
+        // these let analytics tell them apart without client-specific
+        // branching in code. Verified signatures: CLI → entrypoint 'cli';
+        // CC-in-desktop → entrypoint 'claude-desktop'; Cowork → no
+        // entrypoint/agent, plugin id 'desktop-commander-inline'.
+        // Values truncated to GA4's 100-char param limit (same convention as
+        // containerName/containerImage) so an oversized value can never get
+        // the whole event rejected.
+        capture('run_server_mcp_initialized', {
+            host_entrypoint: process.env.CLAUDE_CODE_ENTRYPOINT?.substring(0, 100),
+            host_agent: process.env.AI_AGENT?.substring(0, 100),
+            host_plugin_id: process.env.CLAUDE_PLUGIN_DATA
+                ? path.basename(process.env.CLAUDE_PLUGIN_DATA).substring(0, 100) : undefined
+        });
 
         // Negotiate protocol version with client
         const requestedVersion = request.params?.protocolVersion;
@@ -199,7 +276,7 @@ server.setRequestHandler(InitializeRequestSchema, async (request: InitializeRequ
 });
 
 // Export current client info for access by other modules
-export { currentClient };
+export { currentClient, currentCallIsRemote, currentRemoteClient };
 
 deferLog('info', 'Setting up request handlers...');
 
@@ -207,9 +284,11 @@ deferLog('info', 'Setting up request handlers...');
  * Check if a tool should be included based on current client
  */
 function shouldIncludeTool(toolName: string): boolean {
-    // Exclude give_feedback_to_desktop_commander for desktop-commander client
-    if (toolName === 'give_feedback_to_desktop_commander' && currentClient?.name === 'desktop-commander') {
-        return false;
+    // Exclude these tools for desktop-commander client (DC-specific meta-tools not useful when DC itself is the client)
+    if (currentClient?.name === 'desktop-commander-app') {
+        if (toolName === 'give_feedback_to_desktop_commander' || toolName === 'get_prompts') {
+            return false;
+        }
     }
 
     // Add more conditional tool logic here as needed
@@ -221,6 +300,7 @@ function shouldIncludeTool(toolName: string): boolean {
 server.setRequestHandler(ListToolsRequestSchema, async () => {
     try {
         // logToStderr('debug', 'Generating tools list...');
+        const showMcpUiPreviews = await shouldShowMcpUiPreviews();
 
         // Build complete tools array
         const allTools = [
@@ -241,7 +321,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         - systemInfo (operating system and environment details)
                         ${CMD_PREFIX_DESCRIPTION}`,
                 inputSchema: zodToJsonSchema(GetConfigArgsSchema),
-                _meta: buildUiToolMeta(CONFIG_EDITOR_RESOURCE_URI, true),
+                _meta: buildUiToolMeta(CONFIG_EDITOR_RESOURCE_URI, true, showMcpUiPreviews),
                 annotations: {
                     title: "Get Configuration",
                     readOnlyHint: true,
@@ -335,7 +415,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         ${PATH_GUIDANCE}
                         ${CMD_PREFIX_DESCRIPTION}`,
                 inputSchema: zodToJsonSchema(ReadFileArgsSchema),
-                _meta: buildUiToolMeta(FILE_PREVIEW_RESOURCE_URI, true),
+                _meta: buildUiToolMeta(FILE_PREVIEW_RESOURCE_URI, true, showMcpUiPreviews),
                 annotations: {
                     title: "Read File or URL",
                     readOnlyHint: true,
@@ -403,6 +483,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         ${PATH_GUIDANCE}
                         ${CMD_PREFIX_DESCRIPTION}`,
                 inputSchema: zodToJsonSchema(WriteFileArgsSchema),
+                _meta: buildUiToolMeta(FILE_PREVIEW_RESOURCE_URI, true, showMcpUiPreviews),
                 annotations: {
                     title: "Write File",
                     readOnlyHint: false,
@@ -517,11 +598,13 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         [FILE] src/tools/filesystem.ts
                         
                         If a directory cannot be accessed, it will show [DENIED] instead.
+                        If a path does not exist, it will show [NOT_FOUND] instead.
                         Only works within allowed directories.
                         
                         ${PATH_GUIDANCE}
                         ${CMD_PREFIX_DESCRIPTION}`,
                 inputSchema: zodToJsonSchema(ListDirectoryArgsSchema),
+                _meta: buildUiToolMeta(FILE_PREVIEW_RESOURCE_URI, true, showMcpUiPreviews),
                 annotations: {
                     title: "List Directory Contents",
                     readOnlyHint: true,
@@ -781,6 +864,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                         ${PATH_GUIDANCE}
                         ${CMD_PREFIX_DESCRIPTION}`,
                 inputSchema: zodToJsonSchema(EditBlockArgsSchema),
+                _meta: buildUiToolMeta(FILE_PREVIEW_RESOURCE_URI, true, showMcpUiPreviews),
                 annotations: {
                     title: "Edit Block",
                     readOnlyHint: false,
@@ -1165,31 +1249,62 @@ import * as handlers from './handlers/index.js';
 import { ServerResult } from './types.js';
 
 server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest): Promise<ServerResult> => {
+    const args = request.params.arguments;
+    // Calls fired programmatically by the widget UIs (file preview, config
+    // editor) carry origin:'ui'. They are real tool executions but not agent
+    // actions, so they must produce zero telemetry: running them inside the
+    // UI-origin capture context makes capture() drop every event they raise
+    // (server_call_tool, server_read_file, server_edit_block, ...). Deliberate
+    // UI interactions are tracked separately via mcp_ui_event.
+    const isUiOriginCall = !!(args && typeof args === 'object' && (args as any).origin === 'ui');
+    if (isUiOriginCall) {
+        return runInUiOriginCallContext(() => handleCallToolRequest(request));
+    }
+    return handleCallToolRequest(request);
+});
+
+async function handleCallToolRequest(request: CallToolRequest): Promise<ServerResult> {
     const { name, arguments: args } = request.params;
     const startTime = Date.now();
+    // Hoisted above the try so the finally block can read them when emitting the
+    // server_call_tool completion event (duration + status), even on the crash path.
+    let telemetryData: any = { tool_name: name };
+    let result: ServerResult;
+    let isError = false;
 
     try {
-        // Prepare telemetry data - add config key for set_config_value
-        const telemetryData: any = { name };
-        // Extract metadata from _meta field if present
+        // telemetryData declared above; extract metadata from _meta field if present
         const metadata = request.params._meta as any;
-        if (metadata && typeof metadata === 'object') {
-            // add remote flag if present (convert to string for GA4)
-            if (metadata.remote) {
-                telemetryData.remote = String(metadata.remote);
-            }
-            // Dynamically update client info if provided in _meta
-            // To use in capture later
-            if (metadata.clientInfo) {
-                await updateCurrentClient(metadata.clientInfo);
-                telemetryData.client_name = metadata.clientInfo.name;
-                telemetryData.client_version = metadata.clientInfo.version;
-            }
+        // Reset remote attribution for every call so a prior remote call never
+        // leaks its flag onto a subsequent local call. Set to true only when
+        // this call carries the remote marker in _meta.
+        const isRemoteCall = !!(metadata && typeof metadata === 'object' && metadata.remote);
+        setCurrentCallIsRemote(isRemoteCall);
+        if (isRemoteCall) {
+            // add remote flag (convert to string for telemetry)
+            telemetryData.remote = String(metadata.remote);
+            // Remote calls carry the originating MCP client (e.g. openai-mcp,
+            // claude-ai) in _meta.clientInfo. Attribute this call to that remote
+            // client — NOT the device's own currentClient. Fall back to a sentinel
+            // when it's absent so the call is visibly remote-but-unattributed
+            // rather than masquerading as the local device client. We deliberately
+            // do NOT call updateCurrentClient here: currentClient tracks the LOCAL
+            // client and must not be polluted (nor its transport reconfigured) by
+            // remote callers.
+            const remoteClient =
+                metadata.clientInfo && (metadata.clientInfo.name || metadata.clientInfo.version)
+                    ? metadata.clientInfo
+                    : { name: 'remote-unknown', version: 'unknown' };
+            setCurrentRemoteClient(remoteClient);
+            telemetryData.client_name = remoteClient.name;
+            telemetryData.client_version = remoteClient.version;
+        } else {
+            // Local call — clear any remote attribution left by a prior call.
+            setCurrentRemoteClient(null);
         }
 
         if (name === 'set_config_value' && args && typeof args === 'object' && 'key' in args) {
             telemetryData.set_config_value_key_name = (args as any).key;
-            telemetryData.call_origin = (args as any).origin === 'ui' ? 'ui' : 'llm';
         }
         if (name === 'get_prompts' && args && typeof args === 'object') {
             const promptArgs = args as any;
@@ -1203,13 +1318,11 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
             }
         }
 
-        capture_call_tool('server_call_tool', telemetryData);
-
         // Track tool call
         trackToolCall(name, args);
 
         // Using a more structured approach with dedicated handlers
-        let result: ServerResult;
+        // (result is declared above so the finally block can read execution status)
 
         switch (name) {
             // Config tools
@@ -1425,6 +1538,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
 
         // Add tool call to history (exclude only get_recent_tool_calls to prevent recursion)
         const duration = Date.now() - startTime;
+        isError = !!result.isError;
         const EXCLUDED_TOOLS = [
             'get_recent_tool_calls',
             'track_ui_event'
@@ -1527,8 +1641,30 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
             result = await processDockerPrompt(result, name);
         }
 
+        // If the caller sent parameters this tool does not support, Zod silently
+        // strips them. Prepend a corrective warning so the model knows they were
+        // ignored and which parameters are actually supported.
+        try {
+            const argSchema = toolArgSchemas[name];
+            if (argSchema && result && Array.isArray((result as any).content)) {
+                const unsupported = detectUnsupportedParams(args, argSchema);
+                if (unsupported.length > 0) {
+                    const warning = buildUnsupportedParamsWarning(
+                        name, unsupported, getSupportedParams(argSchema)
+                    );
+                    (result as any).content = [
+                        { type: "text", text: warning },
+                        ...(result as any).content,
+                    ];
+                }
+            }
+        } catch {
+            // Never let the advisory warning break an otherwise-successful call.
+        }
+
         return result;
     } catch (error) {
+        isError = true;
         const errorMessage = error instanceof Error ? error.message : String(error);
 
         // Track the failure
@@ -1541,8 +1677,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
             content: [{ type: "text", text: `Error: ${errorMessage}` }],
             isError: true,
         };
+    } finally {
+        // Single tool-call telemetry event, fired AFTER execution so it can carry
+        // timing. In a finally so it still fires on the hard-crash path (the catch
+        // above). Only missed if a tool never returns or throws (a true hang).
+        // Not emitted for track_ui_event (it is just the transport for
+        // mcp_ui_event) — and UI-origin calls are dropped wholesale by the
+        // capture layer, so server_call_tool reflects only genuine
+        // agent-driven tool calls.
+        if (name !== 'track_ui_event') {
+            capture_call_tool('server_call_tool', {
+                ...telemetryData,
+                duration_ms: Date.now() - startTime,
+                is_error: String(isError),
+            });
+        }
     }
-});
+}
 
 // Add no-op handlers so Visual Studio initialization succeeds
 server.setRequestHandler(ListResourceTemplatesRequestSchema, async () => ({ resourceTemplates: [] }));

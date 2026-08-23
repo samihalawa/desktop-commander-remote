@@ -1,558 +1,270 @@
 /**
- * Top-level controller for the File Preview app. It routes structured content into the appropriate renderer, handles host events, and coordinates user-facing state changes.
+ * Composition root for the File Preview app. It wires host services, file-type handlers, and specialized controllers together without owning feature logic inline.
  */
-import { formatJsonIfPossible, inferLanguageFromPath, renderCodeViewer } from './components/code-viewer.js';
-import { renderHtmlPreview } from './components/html-renderer.js';
-import { renderMarkdown } from './components/markdown-renderer.js';
-import { escapeHtml } from './components/highlighting.js';
-import { isAllowedImageMimeType, normalizeImageMimeType } from './image-preview.js';
-import type { FilePreviewStructuredContent } from '../../../types.js';
-import type { HtmlPreviewMode } from './types.js';
+import { App } from '@modelcontextprotocol/ext-apps';
 import { createCompactRowShellController, type ToolShellController } from '../../shared/tool-shell.js';
 import { createWidgetStateStorage } from '../../shared/widget-state.js';
 import { renderCompactRow } from '../../shared/compact-row.js';
-import { connectWithSharedHostContext, isObjectRecord, type UiChromeState } from '../../shared/host-context.js';
+import { connectWithSharedHostContext, type UiChromeState } from '../../shared/host-context.js';
 import { createUiEventTracker } from '../../shared/ui-event-tracker.js';
-import { App } from '@modelcontextprotocol/ext-apps';
+import { attachDirectoryHandlers } from './directory-controller.js';
+import { buildDocumentLayout } from './document-layout.js';
+import { getDocumentFullscreenAvailability, parseReadRange, stripReadStatusLine } from './document-workspace.js';
+import { getFileTypeCapabilities, renderPayloadBody } from './file-type-handlers.js';
+import { buildOpenInEditorCommand, buildOpenInFolderCommand, renderMarkdownEditorAppIcon } from './host/external-actions.js';
+import { attachSelectionContext } from './host/selection-context.js';
+import { createMarkdownController } from './markdown/controller.js';
+import {
+    createConflictDialogController,
+    renderConflictDialogMarkup,
+    type ConflictDialogController,
+} from './markdown/conflict-dialog.js';
+import type { RenderPayload } from './model.js';
+import { attachPanelActions } from './panel-actions.js';
+import { extractRenderPayload, extractToolText, getFileExtensionForAnalytics, isLikelyUrl, isPreviewStructuredContent } from './payload-utils.js';
+import type { HtmlPreviewMode } from './types.js';
 
 let isExpanded = false;
 let hideSummaryRow = false;
-let previewShownFired = false;
 let onRender: (() => void) | undefined;
 let trackUiEvent: ((event: string, params?: Record<string, unknown>) => void) | undefined;
+let conflictDialogController: ConflictDialogController | undefined;
 let rpcCallTool: ((name: string, args: Record<string, unknown>) => Promise<unknown>) | undefined;
 let rpcUpdateContext: ((text: string) => void) | undefined;
+let openExternalLink: ((url: string) => Promise<boolean>) | undefined;
+let requestDisplayMode: ((mode: 'inline' | 'fullscreen') => Promise<string | null>) | undefined;
 let shellController: ToolShellController | undefined;
+let currentPayload: RenderPayload | undefined;
+let currentHtmlMode: HtmlPreviewMode = 'rendered';
+let currentHostContext: Record<string, unknown> | undefined;
+let rerenderCurrent: (() => void) | undefined;
+let syncPayload: ((payload?: RenderPayload) => void) | undefined;
+let persistPayload: ((payload: RenderPayload) => void) | undefined;
+let localPayloadOverride: RenderPayload | undefined;
+let hostPayload: RenderPayload | undefined;
+let inlinePayloadBeforeFullscreen: RenderPayload | undefined;
+let directoryBackPayload: RenderPayload | undefined;
+let selectionAbortController: AbortController | null = null;
+const markdownEditorAppCache = new Map<string, { appName: string; appPath?: string }>();
 
-function getFileExtensionForAnalytics(filePath: string): string {
-    const normalizedPath = filePath.trim().replace(/\\/g, '/');
-    const fileName = normalizedPath.split('/').pop() ?? normalizedPath;
-    const dotIndex = fileName.lastIndexOf('.');
-    if (dotIndex <= 0 || dotIndex === fileName.length - 1) {
-        return 'none';
-    }
-    return fileName.slice(dotIndex + 1).toLowerCase();
+function getTelemetryToolName(payload: RenderPayload | undefined): string {
+    return typeof payload?.sourceTool === 'string' ? payload.sourceTool : 'read_file';
 }
 
-// Internal type used only for rendering — extends the public type with the
-// text content sourced from the MCP content array (not structuredContent).
-type RenderPayload = FilePreviewStructuredContent & { content: string };
-
-function isPreviewStructuredContent(value: unknown): value is FilePreviewStructuredContent {
-    if (!isObjectRecord(value)) {
-        return false;
-    }
-
-    return (
-        typeof value.fileName === 'string' &&
-        typeof value.filePath === 'string' &&
-        typeof value.fileType === 'string'
-    );
+async function callToolIfReady(name: string, args: Record<string, unknown>): Promise<unknown | undefined> {
+    return rpcCallTool ? rpcCallTool(name, args) : undefined;
 }
 
-function buildRenderPayload(
-    meta: FilePreviewStructuredContent,
-    text: string
-): RenderPayload {
-    return { ...meta, content: text };
+function getAvailableDisplayModes(): string[] {
+    const rawModes = currentHostContext?.availableDisplayModes;
+    if (!Array.isArray(rawModes)) {
+        return [];
+    }
+
+    return rawModes.filter((mode): mode is string => typeof mode === 'string');
 }
 
-function extractRenderPayload(value: unknown): RenderPayload | undefined {
-    if (!isObjectRecord(value)) {
-        return undefined;
-    }
-    const meta = isPreviewStructuredContent(value.structuredContent)
-        ? value.structuredContent
-        : isPreviewStructuredContent(value)
-            ? value
-            : null;
-    if (!meta) return undefined;
-    const text = extractToolText(value) ?? extractToolText(value.structuredContent) ?? '';
-    return buildRenderPayload(meta, text);
+function getCurrentDisplayMode(): string | null {
+    return typeof currentHostContext?.displayMode === 'string'
+        ? currentHostContext.displayMode
+        : null;
 }
 
-function extractToolText(value: unknown): string | undefined {
-    if (!isObjectRecord(value)) {
-        return undefined;
+function storePayloadOverride(payload: RenderPayload): void {
+    localPayloadOverride = payload;
+    currentPayload = payload;
+    persistPayload?.(payload);
+}
+
+function getEffectiveIncomingPayload(payload: RenderPayload): RenderPayload {
+    if (!localPayloadOverride) {
+        return payload;
     }
-    const content = value.content;
-    if (!Array.isArray(content)) {
-        return undefined;
+
+    if (localPayloadOverride.filePath !== payload.filePath) {
+        localPayloadOverride = undefined;
+        return payload;
     }
-    for (const item of content) {
-        if (!isObjectRecord(item)) {
-            continue;
+
+    const incomingContent = stripReadStatusLine(payload.content);
+    const overriddenContent = stripReadStatusLine(localPayloadOverride.content);
+    if (incomingContent === overriddenContent) {
+        return payload;
+    }
+
+    return localPayloadOverride;
+}
+
+function updateSaveStatusDOM(label: string, statusClass: string): void {
+    const existing = document.querySelector('.panel-save-status') as HTMLElement | null;
+    if (label) {
+        if (existing) {
+            existing.textContent = label;
+            existing.className = `panel-save-status panel-save-status--${statusClass}`;
+        } else {
+            const actions = document.querySelector('.panel-topbar-actions') as HTMLElement | null;
+            if (actions) {
+                const span = document.createElement('span');
+                span.className = `panel-save-status panel-save-status--${statusClass}`;
+                span.textContent = label;
+                actions.prepend(span);
+            }
         }
-        if (item.type === 'text' && typeof item.text === 'string' && item.text.trim().length > 0) {
-            return item.text;
+    } else if (existing) {
+        existing.remove();
+    }
+}
+
+const markdownController = createMarkdownController({
+    callTool: callToolIfReady,
+    openExternalLink: async (url) => (openExternalLink ? openExternalLink(url) : undefined),
+    requestDisplayMode: async (mode) => (requestDisplayMode ? requestDisplayMode(mode) : undefined),
+    getAvailableDisplayModes,
+    getCurrentDisplayMode,
+    getCurrentPayload: () => currentPayload,
+    setExpanded: (expanded) => {
+        isExpanded = expanded;
+    },
+    syncPayload: (payload) => syncPayload?.(payload),
+    storePayloadOverride,
+    rerender: () => {
+        rerenderCurrent?.();
+    },
+    updateSaveStatus: updateSaveStatusDOM,
+    trackUiEvent: (event, params) => trackUiEvent?.(event, params),
+    showConflictDialog: (options) => {
+        if (conflictDialogController) {
+            conflictDialogController.open(options);
+            return;
         }
+        // Dialog not yet initialized (would only happen if the save failure
+        // somehow fires before bootstrapApp). Fall back to the cancel callback
+        // so the editor still shows its inline note instead of silently no-op'ing.
+        console.warn('[file-preview] conflictDialogController not ready; firing onCancel fallback');
+        options.onCancel?.();
+    },
+});
+
+// Only read_file's own parameters may ride along on a re-read. Forwarding a
+// different tool's args (e.g. edit_block's old_string) makes the server prepend
+// an "unsupported params" warning that would pollute the pulled content.
+const READ_ARG_KEYS = ['path', 'offset', 'length', 'sheet', 'range', 'isUrl'] as const;
+
+function pickReadArgs(args: unknown): Record<string, unknown> | undefined {
+    if (!args || typeof args !== 'object') {
+        return undefined;
+    }
+    const src = args as Record<string, unknown>;
+    // edit_block calls the file "file_path"; read_file/write_file call it "path".
+    const path = typeof src.path === 'string'
+        ? src.path
+        : typeof src.file_path === 'string'
+            ? src.file_path
+            : undefined;
+    if (!path) {
+        return undefined;
+    }
+    const out: Record<string, unknown> = { path };
+    for (const key of READ_ARG_KEYS) {
+        if (key !== 'path' && src[key] !== undefined) {
+            out[key] = src[key];
+        }
+    }
+    return out;
+}
+
+// The host doesn't send the tool name with tool-input, so infer mutations from
+// their arg shape: write_file carries `content`; edit_block `old_string`/
+// `new_string`. Drives two things: timing (a mutation's tool-input arrives
+// BEFORE the file changes, so those pull at tool-result time instead of input
+// time) and telemetry (the pulled payload's sourceTool is re-stamped with the
+// originating tool, since the pull itself is always a read_file).
+function inferMutationTool(args: unknown): 'write_file' | 'edit_block' | undefined {
+    if (!args || typeof args !== 'object') {
+        return undefined;
+    }
+    const src = args as Record<string, unknown>;
+    if (src.old_string !== undefined || src.new_string !== undefined) {
+        return 'edit_block';
+    }
+    if (src.content !== undefined) {
+        return 'write_file';
     }
     return undefined;
 }
 
-function isLikelyUrl(filePath: string): boolean {
-    return /^https?:\/\//i.test(filePath);
-}
+// Bound the RPC read so a stalled host response resolves to onFail instead of
+// hanging. Kept under the loading watchdog (PREVIEW_WATCHDOG_MS) so the pull
+// gets its chance to fail before the failure row appears.
+const PULL_TIMEOUT_MS = 8000;
 
-function buildBreadcrumb(filePath: string): string {
-    const normalized = filePath.replace(/\\/g, '/');
-    const parts = normalized.split('/').filter(Boolean);
-    // Show last 3-4 meaningful segments as breadcrumb
-    const tail = parts.slice(-4);
-    return tail.map(p => escapeHtml(p)).join(' <span class="breadcrumb-sep">›</span> ');
-}
-
-function getParentDirectory(filePath: string): string {
-    const normalized = filePath.replace(/\\/g, '/');
-    const lastSlash = normalized.lastIndexOf('/');
-    if (lastSlash <= 0) {
-        return filePath;
-    }
-    return normalized.slice(0, lastSlash);
-}
-
-function shellQuote(value: string): string {
-    return `'${value.replace(/'/g, `'\\''`)}'`;
-}
-
-function encodePowerShellCommand(script: string): string {
-    // PowerShell -EncodedCommand expects UTF-16LE bytes.
-    const utf16leBytes: number[] = [];
-    for (let index = 0; index < script.length; index += 1) {
-        const codeUnit = script.charCodeAt(index);
-        utf16leBytes.push(codeUnit & 0xff, codeUnit >> 8);
-    }
-
-    let binary = '';
-    for (const byte of utf16leBytes) {
-        binary += String.fromCharCode(byte);
-    }
-    return btoa(binary);
-}
-
-function buildOpenInFolderCommand(filePath: string): string | undefined {
-    const trimmedPath = filePath.trim();
-    if (!trimmedPath || isLikelyUrl(trimmedPath)) {
-        return undefined;
-    }
-
-    const userAgent = navigator.userAgent.toLowerCase();
-    if (userAgent.includes('win')) {
-        const escapedForPowerShell = trimmedPath.replace(/'/g, "''");
-        const script = `Start-Process -FilePath explorer.exe -ArgumentList @('/select,','${escapedForPowerShell}')`;
-        return `powershell.exe -NoProfile -NonInteractive -EncodedCommand ${encodePowerShellCommand(script)}`;
-    }
-    if (userAgent.includes('mac')) {
-        return `open -R ${shellQuote(trimmedPath)}`;
-    }
-
-    return `xdg-open ${shellQuote(getParentDirectory(trimmedPath))}`;
-}
-
-function renderRawFallback(source: string): string {
-    return `<pre class="code-viewer"><code class="hljs language-text">${escapeHtml(source)}</code></pre>`;
-}
-
-function stripReadStatusLine(content: string): string {
-    // Remove the synthetic read status header shown by read_file pagination.
-    return content.replace(/^\[Reading [^\]]+\]\r?\n?/, '');
-}
-
-function renderImageBody(payload: RenderPayload): { html: string; notice?: string } {
-    const mimeType = normalizeImageMimeType(payload.mimeType);
-    if (!isAllowedImageMimeType(mimeType)) {
-        return {
-            notice: 'Preview is unavailable for this image format.',
-            html: '<div class="panel-content source-content"></div>'
-        };
-    }
-
-    if (!payload.imageData || payload.imageData.trim().length === 0) {
-        return {
-            notice: 'Preview is unavailable because image data is missing.',
-            html: '<div class="panel-content source-content"></div>'
-        };
-    }
-
-    const src = `data:${mimeType};base64,${payload.imageData}`;
-    return {
-        html: `<div class="panel-content image-content"><div class="image-preview"><img src="${escapeHtml(src)}" alt="${escapeHtml(payload.fileName)}" loading="eager" decoding="async"></div></div>`
-    };
-}
-
-function countContentLines(content: string): number {
-    const cleaned = stripReadStatusLine(content);
-    if (cleaned === '') return 0;
-    const lines = cleaned.split('\n');
-    return lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
-}
-
-interface ReadRange {
-    fromLine: number;
-    toLine: number;
-    totalLines: number;
-    isPartial: boolean;
-}
-
-function parseReadRange(content: string): ReadRange | undefined {
-    // Parse "[Reading N lines from line M (total: T lines, R remaining)]"
-    // or    "[Reading N lines from start (total: T lines, R remaining)]"
-    const match = content.match(/^\[Reading (\d+) lines from (?:line )?(\d+|start) \(total: (\d+) lines/);
-    if (!match) return undefined;
-    const count = parseInt(match[1], 10);
-    const from = match[2] === 'start' ? 1 : parseInt(match[2], 10);
-    const total = parseInt(match[3], 10);
-    return {
-        fromLine: from,
-        toLine: from + count - 1,
-        totalLines: total,
-        isPartial: count < total
-    };
-}
-
-function renderBody(payload: RenderPayload, htmlMode: HtmlPreviewMode, startLine = 1): { html: string; notice?: string } {
-    const cleanedContent = stripReadStatusLine(payload.content);
-
-    if (payload.fileType === 'image') {
-        return renderImageBody(payload);
-    }
-
-    if (payload.fileType === 'unsupported') {
-        return {
-            notice: 'Preview is not available for this file type.',
-            html: '<div class="panel-content source-content"></div>'
-        };
-    }
-
-    if (payload.fileType === 'html') {
-        return renderHtmlPreview(cleanedContent, htmlMode);
-    }
-
-    if (payload.fileType !== 'markdown') {
-        const detectedLanguage = inferLanguageFromPath(payload.filePath);
-        const formatted = formatJsonIfPossible(cleanedContent, payload.filePath);
-        return {
-            notice: formatted.notice,
-            html: `<div class="panel-content source-content">${renderCodeViewer(formatted.content, detectedLanguage, startLine)}</div>`
-        };
-    }
-
-    try {
-        return {
-            html: `<div class="panel-content markdown-content"><article class="markdown markdown-doc">${renderMarkdown(cleanedContent)}</article></div>`
-        };
-    } catch {
-        return {
-            notice: 'Markdown renderer failed. Showing raw source instead.',
-            html: `<div class="panel-content source-content">${renderRawFallback(cleanedContent)}</div>`
-        };
-    }
-}
-
-function attachCopyHandler(payload: RenderPayload): void {
-    const copyButton = document.getElementById('copy-source');
-    if (!copyButton) {
-        return;
-    }
-
-    const fallbackCopy = (text: string): boolean => {
-        const textArea = document.createElement('textarea');
-        textArea.value = text;
-        textArea.setAttribute('readonly', '');
-        textArea.style.position = 'fixed';
-        textArea.style.top = '-9999px';
-        document.body.appendChild(textArea);
-        textArea.select();
-        const success = document.execCommand('copy');
-        document.body.removeChild(textArea);
-        return success;
-    };
-
-    const setButtonState = (label: string, revertMs?: number): void => {
-        copyButton.setAttribute('title', label);
-        copyButton.setAttribute('aria-label', label);
-        copyButton.textContent = label;
-        if (revertMs) {
-            setTimeout(() => {
-                copyButton.textContent = 'Copy';
-                copyButton.setAttribute('title', 'Copy source');
-                copyButton.setAttribute('aria-label', 'Copy source');
-            }, revertMs);
-        }
-    };
-
-    const copyTextData = async (text: string): Promise<boolean> => {
-        try {
-            if (navigator.clipboard?.writeText) {
-                await navigator.clipboard.writeText(text);
-                return true;
-            }
-            return fallbackCopy(text);
-        } catch {
-            return fallbackCopy(text);
-        }
-    };
-
-    copyButton.addEventListener('click', async () => {
-        trackUiEvent?.('copy_clicked', {
-            file_type: payload.fileType,
-            file_extension: getFileExtensionForAnalytics(payload.filePath)
-        });
-
-        const cleanedContent = stripReadStatusLine(payload.content);
-
-        const copied = await copyTextData(cleanedContent);
-        setButtonState(copied ? 'Copied!' : 'Copy failed', 1500);
-    });
-}
-
-function attachHtmlToggleHandler(container: HTMLElement, payload: RenderPayload, htmlMode: HtmlPreviewMode): void {
-    const toggleButton = document.getElementById('toggle-html-mode');
-    if (!toggleButton || payload.fileType !== 'html') {
-        return;
-    }
-    toggleButton.addEventListener('click', () => {
-        const nextMode: HtmlPreviewMode = htmlMode === 'rendered' ? 'source' : 'rendered';
-        trackUiEvent?.('html_view_toggled', {
-            file_type: payload.fileType,
-            file_extension: getFileExtensionForAnalytics(payload.filePath)
-        });
-        renderApp(container, payload, nextMode, isExpanded);
-    });
-}
-
-function attachOpenInFolderHandler(payload: RenderPayload): void {
-    const openButton = document.getElementById('open-in-folder') as HTMLButtonElement | null;
-    if (!openButton) {
-        return;
-    }
-
-    const command = buildOpenInFolderCommand(payload.filePath);
-    if (!command) {
-        openButton.disabled = true;
-        return;
-    }
-
-    openButton.addEventListener('click', async () => {
-        trackUiEvent?.('open_in_folder', {
-            file_type: payload.fileType,
-            file_extension: getFileExtensionForAnalytics(payload.filePath)
-        });
-
-        try {
-            await rpcCallTool?.('start_process', {
-                command,
-                timeout_ms: 12000
-            });
-        } catch {
-            // Keep UI stable if opening folder fails.
-        }
-    });
-}
-
-function attachLoadAllHandler(
-    container: HTMLElement,
-    payload: RenderPayload,
-    htmlMode: HtmlPreviewMode
-): void {
-    const beforeBtn = document.getElementById('load-before') as HTMLButtonElement | null;
-    const afterBtn = document.getElementById('load-after') as HTMLButtonElement | null;
-    if (!beforeBtn && !afterBtn) {
-        return;
-    }
-
-    const range = parseReadRange(payload.content);
-    if (!range?.isPartial) return;
-
-    const currentContent = stripReadStatusLine(payload.content);
-
-    const loadLines = async (btn: HTMLButtonElement, direction: 'before' | 'after'): Promise<void> => {
-        const originalText = btn.textContent;
-        btn.textContent = 'Loading…';
-        btn.disabled = true;
-
-        trackUiEvent?.(direction === 'before' ? 'load_lines_before' : 'load_lines_after', {
-            file_type: payload.fileType,
-            file_extension: getFileExtensionForAnalytics(payload.filePath)
-        });
-
-        try {
-            // Load only the missing portion
-            const readArgs = direction === 'before'
-                ? { path: payload.filePath, offset: 0, length: range.fromLine - 1 }
-                : { path: payload.filePath, offset: range.toLine };
-
-            const result = await rpcCallTool?.('read_file', readArgs);
-            const resultObj = result as { content?: Array<{ text?: string }> } | undefined;
-            const newText = resultObj?.content?.[0]?.text;
-
-            if (newText && typeof newText === 'string') {
-                const cleanNew = stripReadStatusLine(newText);
-
-                // Merge: prepend or append the new lines
-                const merged = direction === 'before'
-                    ? cleanNew + (cleanNew.endsWith('\n') ? '' : '\n') + currentContent
-                    : currentContent + (currentContent.endsWith('\n') ? '' : '\n') + cleanNew;
-
-                // Build updated status line reflecting the new range
-                const newFrom = direction === 'before' ? 1 : range.fromLine;
-                const newTo = direction === 'after' ? range.totalLines : range.toLine;
-                const lineCount = newTo - newFrom + 1;
-                const remaining = range.totalLines - newTo;
-                const isStillPartial = newFrom > 1 || newTo < range.totalLines;
-                const statusLine = isStillPartial
-                    ? `[Reading ${lineCount} lines from ${newFrom === 1 ? 'start' : `line ${newFrom}`} (total: ${range.totalLines} lines, ${remaining} remaining)]\n`
-                    : '';
-
-                const mergedPayload: RenderPayload = {
-                    ...payload,
-                    content: statusLine + merged
-                };
-                renderApp(container, mergedPayload, htmlMode, isExpanded);
-            } else {
-                btn.textContent = 'Failed to load';
-                setTimeout(() => { btn.textContent = originalText; btn.disabled = false; }, 2000);
-            }
-        } catch {
-            btn.textContent = 'Failed to load';
-            setTimeout(() => { btn.textContent = originalText; btn.disabled = false; }, 2000);
-        }
-    };
-
-    beforeBtn?.addEventListener('click', () => void loadLines(beforeBtn, 'before'));
-    afterBtn?.addEventListener('click', () => void loadLines(afterBtn, 'after'));
-}
+// One in-flight pull per path — the input-time pull and a tool-result-triggered
+// pull for the same call would otherwise read the file twice.
+let pullInFlightPath: string | undefined;
 
 /**
- * Tracks native text selection and pushes it to the host via ui/update-model-context.
- *
- * How it works:
- * 1. User drags to select text anywhere in the preview (markdown, code, HTML).
- * 2. The selectionchange event fires; we extract the selected string.
- * 3. We call rpcUpdateContext() which sends a ui/update-model-context JSON-RPC
- *    request to the host with the selected text + file path (+ line numbers for code).
- * 4. The host stores this as widget context.
- * 5. The LLM can access it by calling read_widget_context(tool_name="desktop-commander:read_file").
- *
- * Note: as of Feb 2025, Claude does NOT auto-inject ui/update-model-context into
- * the LLM's context window. The LLM must actively call read_widget_context to see
- * the selection. A floating tooltip near the selection tells the user this is working.
+ * The widget's render path: pull content + metadata over the RPC channel
+ * (`app.callServerTool` with origin:'ui'). The notification channel is not used
+ * for rendering — the host may strip structuredContent from it or swallow it
+ * entirely (images). `args` reproduces the original read exactly
+ * (offset/length/sheet/range/isUrl) so partial reads stay faithful.
  */
-let selectionAbortController: AbortController | null = null;
-
-function attachTextSelectionHandler(payload: RenderPayload): void {
-    const contentWrapper = document.querySelector('.panel-content-wrapper') as HTMLElement | null;
-    if (!contentWrapper) return;
-
-    // Abort any previous selectionchange listener to avoid leaking listeners/closures
-    if (selectionAbortController) {
-        selectionAbortController.abort();
-        selectionAbortController = null;
+async function pullPayloadByArgs(
+    args: Record<string, unknown>,
+    onReady: (payload: RenderPayload) => void,
+    onFail: () => void
+): Promise<void> {
+    const filePath = typeof args.path === 'string' ? args.path : undefined;
+    if (!filePath) {
+        onFail();
+        return;
     }
-    selectionAbortController = new AbortController();
-
-    let hintEl: HTMLElement | null = null;
-    let lastSelectedText = '';
-    let hideTimer: ReturnType<typeof setTimeout> | null = null;
-
-    function positionHint(selection: Selection): void {
-        if (!hintEl) return;
-        const range = selection.getRangeAt(0);
-        const rect = range.getBoundingClientRect();
-        const wrapperRect = contentWrapper!.getBoundingClientRect();
-
-        // Position above the selection, centered horizontally
-        let left = rect.left + rect.width / 2 - wrapperRect.left;
-        let top = rect.top - wrapperRect.top + contentWrapper!.scrollTop - 32;
-
-        // Clamp within wrapper bounds
-        const hintWidth = hintEl.offsetWidth || 200;
-        left = Math.max(8, Math.min(left - hintWidth / 2, contentWrapper!.clientWidth - hintWidth - 8));
-        top = Math.max(4, top);
-
-        hintEl.style.left = `${left}px`;
-        hintEl.style.top = `${top}px`;
+    if (pullInFlightPath === filePath) {
+        return;
     }
-
-    function showHint(selection: Selection): void {
-        if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
-
-        if (!hintEl) {
-            hintEl = document.createElement('div');
-            hintEl.className = 'selection-hint';
-            hintEl.textContent = 'AI can see your selection';
-            contentWrapper!.appendChild(hintEl);
-        }
-        hintEl.classList.add('visible');
-        positionHint(selection);
-    }
-
-    function hideHint(): void {
-        if (!hintEl) return;
-        hintEl.classList.remove('visible');
-        hideTimer = setTimeout(() => { hintEl?.remove(); hintEl = null; }, 200);
-    }
-
-    function getLineInfo(selection: Selection): string {
-        const anchorRow = selection.anchorNode?.parentElement?.closest('.code-line') as HTMLElement | null;
-        const focusRow = selection.focusNode?.parentElement?.closest('.code-line') as HTMLElement | null;
-        if (anchorRow && focusRow) {
-            const a = parseInt(anchorRow.dataset.line ?? '', 10);
-            const f = parseInt(focusRow.dataset.line ?? '', 10);
-            if (!isNaN(a) && !isNaN(f)) {
-                const low = Math.min(a, f);
-                const high = Math.max(a, f);
-                return low === high ? `line ${low}` : `lines ${low}–${high}`;
-            }
-        }
-        return '';
-    }
-
-    document.addEventListener('selectionchange', () => {
-        const selection = document.getSelection();
-        if (!selection || selection.isCollapsed) {
-            if (lastSelectedText) {
-                lastSelectedText = '';
-                rpcUpdateContext?.('');
-                hideHint();
-            }
+    pullInFlightPath = filePath;
+    try {
+        // The host can hold the RPC response indefinitely (e.g. it preempts
+        // delivery to inline-render an image), so callServerTool would await
+        // forever with no throw. Race a timeout so the pull settles either way.
+        const raw = await Promise.race([
+            callToolIfReady('read_file', { ...args, origin: 'ui' }),
+            new Promise<never>((_resolve, reject) => {
+                setTimeout(
+                    () => reject(new Error(`RPC read_file did not respond within ${PULL_TIMEOUT_MS}ms`)),
+                    PULL_TIMEOUT_MS,
+                );
+            }),
+        ]);
+        const payload = extractRenderPayload(raw);
+        if (payload) {
+            onReady(payload);
             return;
         }
-
-        const text = selection.toString().trim();
-        if (!text || text === lastSelectedText) return;
-
-        // Only act on selections within our content area
-        const anchorInContent = contentWrapper!.contains(selection.anchorNode);
-        const focusInContent = contentWrapper!.contains(selection.focusNode);
-        if (!anchorInContent && !focusInContent) {
-            if (lastSelectedText) {
-                lastSelectedText = '';
-                rpcUpdateContext?.('');
-                hideHint();
-            }
-            return;
-        }
-
-        lastSelectedText = text;
-
-        const lineInfo = getLineInfo(selection);
-        const locationPart = lineInfo ? ` (${lineInfo})` : '';
-        const context = `User selected text from file ${payload.filePath}${locationPart}:\n\`\`\`\n${text}\n\`\`\``;
-
-        rpcUpdateContext?.(context);
-        showHint(selection);
-
-        trackUiEvent?.('text_selected', {
-            file_type: payload.fileType,
-            file_extension: getFileExtensionForAnalytics(payload.filePath),
-            char_count: text.length
-        });
-    }, { signal: selectionAbortController!.signal });
+    } catch {
+        // Timed out or rejected — fall through to the caller's fallback.
+    } finally {
+        pullInFlightPath = undefined;
+    }
+    onFail();
 }
 
+// If a loading state hasn't resolved into a real render within this window, the
+// host most likely never delivered the tool result / RPC response (e.g. it
+// preempted delivery to inline-render an image). Rather than sit on "Preparing
+// preview…" forever, we surface a failure row.
+const PREVIEW_WATCHDOG_MS = 10000;
+let previewWatchdogId: ReturnType<typeof setTimeout> | undefined;
+
+function clearPreviewWatchdog(): void {
+    if (previewWatchdogId !== undefined) {
+        clearTimeout(previewWatchdogId);
+        previewWatchdogId = undefined;
+    }
+}
 
 function renderStatusState(container: HTMLElement, message: string): void {
+    clearPreviewWatchdog();
     container.innerHTML = `
       <main class="shell">
         ${renderCompactRow({ label: message, variant: 'status', interactive: false })}
@@ -568,6 +280,13 @@ function renderLoadingState(container: HTMLElement): void {
       </main>
     `;
     document.body.classList.add('dc-ready');
+    // Fall back to a failure row if nothing renders in time. Any successful
+    // render (renderApp) or explicit status clears this first.
+    clearPreviewWatchdog();
+    previewWatchdogId = setTimeout(() => {
+        previewWatchdogId = undefined;
+        renderStatusState(container, 'Unable to generate preview in this environment.');
+    }, PREVIEW_WATCHDOG_MS);
 }
 
 export function renderApp(
@@ -576,122 +295,153 @@ export function renderApp(
     htmlMode: HtmlPreviewMode = 'rendered',
     expandedState = false
 ): void {
+    clearPreviewWatchdog();
     isExpanded = expandedState;
+    currentHtmlMode = htmlMode;
     shellController?.dispose();
     shellController = undefined;
 
+    if (!payload || payload.fileType !== 'markdown') {
+        markdownController.clear();
+    } else {
+        markdownController.disposeHandles();
+    }
+
     if (!payload) {
+        selectionAbortController?.abort();
+        selectionAbortController = null;
+        currentPayload = undefined;
         renderStatusState(container, 'No preview available for this response.');
         onRender?.();
         return;
     }
 
-    const canCopy = payload.fileType !== 'unsupported' && payload.fileType !== 'image';
-    const canOpenInFolder = !isLikelyUrl(payload.filePath);
-    const fileExtension = getFileExtensionForAnalytics(payload.filePath);
-    const supportsPreview = payload.fileType !== 'unsupported';
-
-    // In DC app (hideSummaryRow), no reason to auto-expand when there's nothing to preview —
-    // the host header already shows the file name and path.
-    if (!supportsPreview && hideSummaryRow) {
+    currentPayload = payload;
+    const capabilities = getFileTypeCapabilities(payload);
+    if (!capabilities.supportsPreview && hideSummaryRow) {
         isExpanded = false;
     }
+
     const range = parseReadRange(payload.content);
-    const body = renderBody(payload, htmlMode, range?.fromLine ?? 1);
-    const notice = body.notice ? `<div class="notice">${body.notice}</div>` : '';
+    const body = renderPayloadBody({
+        payload,
+        htmlMode,
+        startLine: range?.fromLine ?? 1,
+        markdownController,
+    });
+    const markdownWorkspace = payload.fileType === 'markdown' ? markdownController.getState(payload) : undefined;
+    const fileExtension = getFileExtensionForAnalytics(payload.filePath);
+    const isFullscreen = getCurrentDisplayMode() === 'fullscreen';
+    const canGoFullscreen = !isFullscreen && getDocumentFullscreenAvailability({
+        availableDisplayModes: getAvailableDisplayModes(),
+    }).canFullscreen;
 
-    const breadcrumb = buildBreadcrumb(payload.filePath);
-    const lineCount = range ? range.toLine - range.fromLine + 1 : countContentLines(payload.content);
-    const fileTypeLabel = payload.fileType === 'markdown' ? 'MARKDOWN'
-        : payload.fileType === 'html' ? 'HTML'
-        : payload.fileType === 'image' ? 'IMAGE'
-        : fileExtension !== 'none' ? fileExtension.toUpperCase()
-        : 'TEXT';
+    if (payload.fileType === 'markdown' && payload.defaultEditorName) {
+        markdownEditorAppCache.set(payload.filePath, {
+            appName: payload.defaultEditorName,
+            appPath: payload.defaultEditorPath,
+        });
+    }
 
-    const compactLabel = range?.isPartial
-        ? `View lines ${range.fromLine}–${range.toLine}`
-        : 'View file';
-    const footerLabel = range?.isPartial
-        ? `${escapeHtml(fileTypeLabel)} • LINES ${range.fromLine}–${range.toLine} OF ${range.totalLines}`
-        : `${escapeHtml(fileTypeLabel)} • ${lineCount} LINE${lineCount !== 1 ? 'S' : ''}`;
+    const defaultMarkdownEditor = payload.fileType === 'markdown'
+        ? markdownEditorAppCache.get(payload.filePath)
+        : undefined;
 
-    const htmlToggle = payload.fileType === 'html'
-        ? `<button class="panel-action" id="toggle-html-mode">${htmlMode === 'rendered' ? 'Source' : 'Rendered'}</button>`
-        : '';
+    const layout = buildDocumentLayout({
+        payload,
+        body,
+        capabilities,
+        fileExtension,
+        htmlMode,
+        currentDisplayMode: getCurrentDisplayMode(),
+        isExpanded,
+        hideSummaryRow,
+        markdownWorkspace,
+        canGoFullscreen,
+        isMarkdownUndoAvailable: markdownWorkspace ? markdownController.isUndoAvailable(markdownWorkspace) : false,
+        defaultMarkdownEditorName: defaultMarkdownEditor?.appName,
+        markdownEditorAppIcon: renderMarkdownEditorAppIcon(),
+        hasDirectoryBackButton: Boolean(directoryBackPayload),
+    });
 
-    const copyIcon = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>`;
-    const folderIcon = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>`;
-    
-    // Content-area banners for missing lines
-    const hasMissingBefore = range?.isPartial && range.fromLine > 1;
-    const hasMissingAfter = range?.isPartial && range.toLine < range.totalLines && (range.totalLines - range.toLine) > 1;
-    const loadBeforeBanner = hasMissingBefore
-        ? `<button class="load-lines-banner" id="load-before">↑ Load lines 1–${range!.fromLine - 1}</button>`
-        : '';
-    const loadAfterBanner = hasMissingAfter
-        ? `<button class="load-lines-banner" id="load-after">↓ Load lines ${range!.toLine + 1}–${range!.totalLines}</button>`
-        : '';
-
-    container.innerHTML = `
-      <main id="tool-shell" class="shell tool-shell ${isExpanded ? 'expanded' : 'collapsed'}${hideSummaryRow ? ' host-framed' : ''}">
-        ${renderCompactRow({ id: 'compact-toggle', label: compactLabel, filename: payload.fileName, variant: 'ready', expandable: true, expanded: isExpanded, interactive: true })}
-        <section class="panel">
-          <div class="panel-topbar">
-            <span class="panel-breadcrumb" title="${escapeHtml(payload.filePath)}">${breadcrumb}</span>
-            <span class="panel-topbar-actions">
-              ${htmlToggle}
-              ${canOpenInFolder ? `<button class="panel-action" id="open-in-folder">${folderIcon} Open in folder</button>` : ''}
-              ${canCopy && supportsPreview ? `<button class="panel-action" id="copy-source" title="Copy source" aria-label="Copy source">${copyIcon} Copy</button>` : ''}
-            </span>
-          </div>
-          ${notice}
-          <div class="panel-content-wrapper">
-            ${loadBeforeBanner}
-            ${body.html}
-            ${loadAfterBanner}
-          </div>
-          <div class="panel-footer">
-            <span>${footerLabel}</span>
-          </div>
-        </section>
-      </main>
-    `;
+    container.innerHTML = layout.html;
     document.body.classList.add('dc-ready');
-    attachCopyHandler(payload);
-    attachHtmlToggleHandler(container, payload, htmlMode);
-    attachOpenInFolderHandler(payload);
-    attachLoadAllHandler(container, payload, htmlMode);
-    attachTextSelectionHandler(payload);
+
+    attachPanelActions({
+        container,
+        payload,
+        htmlMode,
+        getIsExpanded: () => isExpanded,
+        callTool: callToolIfReady,
+        trackUiEvent,
+        getFileExtensionForAnalytics,
+        buildOpenInFolderCommand: (filePath) => buildOpenInFolderCommand(filePath, isLikelyUrl),
+        buildOpenInEditorCommand: (filePath) => buildOpenInEditorCommand(filePath, isLikelyUrl, markdownEditorAppCache),
+        render: (nextPayload, nextHtmlMode = 'rendered', nextExpanded = isExpanded) => {
+            renderApp(container, nextPayload, nextHtmlMode, nextExpanded);
+        },
+        updateSaveStatus: updateSaveStatusDOM,
+        markdownController,
+    });
+
+    if (payload.fileType === 'markdown') {
+        markdownController.attachHandlers(payload);
+    }
+
+    selectionAbortController = attachSelectionContext({
+        payload,
+        isMarkdownEditing: payload.fileType === 'markdown' && !!markdownWorkspace,
+        updateContext: rpcUpdateContext,
+        trackUiEvent,
+        getFileExtensionForAnalytics,
+        previousAbortController: selectionAbortController,
+    });
+
+    if (payload.fileType === 'directory') {
+        attachDirectoryHandlers({
+            container,
+            callTool: callToolIfReady,
+            buildOpenInFolderCommand: (filePath) => buildOpenInFolderCommand(filePath, isLikelyUrl),
+            onOpenPayload: (nextPayload) => {
+                directoryBackPayload = payload;
+                renderApp(container, nextPayload, 'rendered', true);
+            },
+        });
+    }
+
+    const backBtn = document.getElementById('dir-back');
+    if (backBtn && directoryBackPayload) {
+        const savedPayload = directoryBackPayload;
+        backBtn.addEventListener('click', () => {
+            directoryBackPayload = undefined;
+            renderApp(container, savedPayload, 'rendered', true);
+        });
+    }
+    if (payload.fileType === 'directory') {
+        directoryBackPayload = undefined;
+    }
 
     const compactRow = document.getElementById('compact-toggle') as HTMLElement | null;
-
     shellController = createCompactRowShellController({
         shell: document.getElementById('tool-shell'),
         compactRow,
-        initialExpanded: isExpanded,
+        initialExpanded: layout.effectiveExpanded,
         onToggle: (expanded) => {
             isExpanded = expanded;
             trackUiEvent?.(expanded ? 'expand' : 'collapse', {
                 file_type: payload.fileType,
-                file_extension: fileExtension
+                file_extension: fileExtension,
             });
         },
         onScrollAfterExpand: () => {
             trackUiEvent?.('scroll_after_expand', {
                 file_type: payload.fileType,
-                file_extension: fileExtension
+                file_extension: fileExtension,
             });
         },
-        onRender
+        onRender,
     });
     onRender?.();
-    if (!previewShownFired) {
-        previewShownFired = true;
-        trackUiEvent?.('preview_shown', {
-            file_type: payload.fileType,
-            file_extension: fileExtension
-        });
-    }
 }
 
 export function bootstrapApp(): void {
@@ -701,8 +451,19 @@ export function bootstrapApp(): void {
     }
     renderLoadingState(container);
 
-    // Use the official App class – it connects to the host via PostMessageTransport
-    // (window.parent by default) and speaks standard MCP JSON-RPC 2.0 over postMessage.
+    // Mount the conflict dialog once at body level. It's position: fixed and
+    // must live outside the app container so that re-renders of the document
+    // body never wipe it while it's open.
+    if (!document.getElementById('md-conflict-modal')) {
+        const dialogHost = document.createElement('div');
+        dialogHost.innerHTML = renderConflictDialogMarkup();
+        const dialogRoot = dialogHost.firstElementChild;
+        if (dialogRoot) {
+            document.body.appendChild(dialogRoot);
+        }
+    }
+    conflictDialogController = createConflictDialogController({ container: document });
+
     const app = new App(
         { name: 'Desktop Commander File Preview', version: '1.0.0' },
         { updateModelContext: { text: {} } },
@@ -718,9 +479,8 @@ export function bootstrapApp(): void {
         hideSummaryRow = chrome.hideSummaryRow;
     };
 
-    // Widget state for cross-host persistence (survives page refresh)
     const widgetState = createWidgetStateStorage<RenderPayload>(
-        (v): v is RenderPayload => isPreviewStructuredContent(v) && typeof (v as any).content === 'string'
+        (value): value is RenderPayload => isPreviewStructuredContent(value) && typeof (value as any).content === 'string'
     );
 
     const renderAndSync = (payload?: RenderPayload): void => {
@@ -729,7 +489,40 @@ export function bootstrapApp(): void {
         }
         renderApp(container, payload, 'rendered', isExpanded);
     };
+    const syncFromPersistedWidgetState = (): void => {
+        const persistedPayload = widgetState.read();
+        if (!persistedPayload) {
+            return;
+        }
 
+        if (
+            currentPayload
+            && currentPayload.filePath === persistedPayload.filePath
+            && stripReadStatusLine(currentPayload.content) === stripReadStatusLine(persistedPayload.content)
+        ) {
+            return;
+        }
+
+        renderAndSync(persistedPayload);
+    };
+
+    syncPayload = renderAndSync;
+    persistPayload = (payload: RenderPayload) => {
+        widgetState.write(payload);
+    };
+    rerenderCurrent = () => {
+        renderApp(container, currentPayload, currentHtmlMode, isExpanded);
+    };
+
+    let pendingCachedPayload: RenderPayload | undefined;
+    let lastToolInputArgs: Record<string, unknown> | undefined;
+    // The mutation tool that produced the current tool call, if any — stamped
+    // onto the pulled payload so telemetry attributes to write_file/edit_block
+    // rather than the read_file pull that rendered it.
+    let lastMutationTool: 'write_file' | 'edit_block' | undefined;
+    // True once the current tool call has been rendered (via the input-time pull),
+    // so a late tool-result notification doesn't trigger a redundant second pull.
+    let renderedForCurrentInput = false;
     let initialStateResolved = false;
     const resolveInitialState = (payload?: RenderPayload, message?: string): void => {
         if (initialStateResolved) {
@@ -737,99 +530,240 @@ export function bootstrapApp(): void {
         }
         initialStateResolved = true;
         if (payload) {
+            hostPayload = payload;
             renderAndSync(payload);
+            if (payload.fileType === 'markdown' && getCurrentDisplayMode() === 'fullscreen') {
+                void markdownController.requestEditMode(payload);
+            }
+            if (payload.fileType === 'markdown') {
+                void markdownController.refreshFromDisk(payload);
+            }
             return;
         }
         renderStatusState(container, message ?? 'No preview available for this response.');
         onRender?.();
     };
 
-    // autoResize handles size reporting; onRender can be a no-op
     onRender = () => {};
 
-    // Wire rpcCallTool through the App's callServerTool proxy
     rpcCallTool = (name: string, args: Record<string, unknown>): Promise<unknown> => (
         app.callServerTool({ name, arguments: args })
     );
-
-    // Wire rpcUpdateContext through the App's updateModelContext
     rpcUpdateContext = (text: string): void => {
         const params = text
             ? { content: [{ type: 'text' as const, text }] }
             : { content: [] as [] };
         app.updateModelContext(params).catch(() => {
-            // Host may not support updateModelContext
+            // Host may not support updateModelContext.
         });
     };
-
-    trackUiEvent = createUiEventTracker(
+    openExternalLink = async (url: string): Promise<boolean> => {
+        const result = await app.openLink({ url });
+        return result.isError !== true;
+    };
+    requestDisplayMode = async (mode: 'inline' | 'fullscreen'): Promise<string | null> => {
+        const result = await app.requestDisplayMode({ mode });
+        return typeof result.mode === 'string' ? result.mode : null;
+    };
+    const filePreviewUiEvent = createUiEventTracker(
         (name, args) => app.callServerTool({ name, arguments: args }),
         {
             component: 'file_preview',
-            baseParams: { tool_name: 'read_file' },
         }
     );
+    trackUiEvent = (event, params = {}) => filePreviewUiEvent(event, {
+        tool_name: getTelemetryToolName(currentPayload ?? hostPayload),
+        ...params,
+    });
 
-    // Register ALL handlers BEFORE connect
-    app.onteardown = async () => {
-        shellController?.dispose();
-        return {};
-    };
+    app.ontoolinput = (params) => {
+        const requestedPath = typeof params.arguments?.path === 'string' ? params.arguments.path : undefined;
+        const readArgs = pickReadArgs(params.arguments);
+        lastMutationTool = inferMutationTool(params.arguments);
+        if (readArgs) {
+            // Retained so mutations (which pull at tool-result time) know what
+            // to re-read — faithfully reproducing offset/length/sheet/range.
+            lastToolInputArgs = readArgs;
+        }
+        if (
+            !initialStateResolved
+            && pendingCachedPayload
+            && requestedPath
+            && pendingCachedPayload.filePath === requestedPath
+        ) {
+            const cached = pendingCachedPayload;
+            pendingCachedPayload = undefined;
+            resolveInitialState(cached);
+            return;
+        }
 
-    app.ontoolinput = (_params) => {
-        // Tool is executing – show loading state
         renderLoadingState(container);
         onRender?.();
+        renderedForCurrentInput = false;
+
+        // All previews render from the widget's own origin:'ui' RPC read — the
+        // notification channel is unreliable (the host strips structuredContent,
+        // and for images swallows the tool-result entirely to inline-render).
+        // tool-input always fires and carries the path + read args, so pull here.
+        // Exception: mutations (write_file/edit_block) — their tool-input arrives
+        // before the file changes, so they pull at tool-result time instead.
+        if (readArgs && !lastMutationTool) {
+            void pullPayloadByArgs(
+                readArgs,
+                (p) => {
+                    renderedForCurrentInput = true;
+                    if (initialStateResolved) {
+                        renderAndSync(getEffectiveIncomingPayload(p));
+                    } else {
+                        resolveInitialState(getEffectiveIncomingPayload(p));
+                    }
+                },
+                // Pull failed/timed out — the loading watchdog shows the failure row.
+                () => {},
+            );
+        }
     };
 
     app.ontoolresult = (result) => {
-        const payload = extractRenderPayload(result);
-        const message = extractToolText(result as unknown as Record<string, unknown>);
-        if (!initialStateResolved) {
-            if (payload) {
-                renderLoadingState(container);
-                onRender?.();
-                window.setTimeout(() => resolveInitialState(payload), 120);
-                return;
-            }
-            if (message) {
-                resolveInitialState(undefined, message);
-            }
+        pendingCachedPayload = undefined;
+
+        // Host-facing responses carry no structuredContent, so this notification
+        // only signals completion. Reads already rendered from their input-time
+        // pull; mutations (write_file/edit_block) pull now that the file changed.
+        if (renderedForCurrentInput) {
             return;
         }
-        if (payload) {
-            renderAndSync(payload);
-        } else if (message) {
-            renderStatusState(container, message);
+
+        const message = extractToolText(result as unknown as Record<string, unknown>);
+        const isError = (result as { isError?: boolean })?.isError === true;
+        const pullArgs = lastToolInputArgs
+            ?? (currentPayload?.filePath ? { path: currentPayload.filePath } : undefined);
+
+        const deliver = (pulled: RenderPayload): void => {
+            renderedForCurrentInput = true;
+            // The pull is always a read_file; re-stamp the originating mutation
+            // tool so telemetry attributes to write_file/edit_block.
+            const p = lastMutationTool ? { ...pulled, sourceTool: lastMutationTool } : pulled;
+            if (initialStateResolved) {
+                renderAndSync(getEffectiveIncomingPayload(p));
+            } else {
+                resolveInitialState(getEffectiveIncomingPayload(p));
+            }
+        };
+        const renderMessageFallback = (): void => {
+            if (!message) {
+                return;
+            }
+            if (!initialStateResolved) {
+                resolveInitialState(undefined, message);
+            } else {
+                renderStatusState(container, message);
+                onRender?.();
+            }
+        };
+
+        // A failed tool call has nothing worth re-reading — show its message.
+        if (!isError && pullArgs) {
+            renderLoadingState(container);
             onRender?.();
+            void pullPayloadByArgs(pullArgs, deliver, renderMessageFallback);
+            return;
         }
+        renderMessageFallback();
     };
 
     app.ontoolcancelled = (params) => {
         resolveInitialState(undefined, params.reason ?? 'Tool was cancelled.');
     };
 
-    // Connect to the host (defaults to window.parent via PostMessageTransport)
+    const handleVisibilitySync = (): void => {
+        if (document.visibilityState === 'visible') {
+            syncFromPersistedWidgetState();
+        }
+    };
+    const handleFocusSync = (): void => {
+        // Only sync cross-tab state if the page was hidden (tab switch).
+        // Simple focus changes within the same page should not trigger a re-render
+        // as it destroys the active editor.
+        if (document.visibilityState !== 'visible') {
+            syncFromPersistedWidgetState();
+        }
+    };
+
+    const teardown = (): void => {
+        clearPreviewWatchdog();
+        shellController?.dispose();
+        shellController = undefined;
+        markdownController.disposeHandles();
+        selectionAbortController?.abort();
+        selectionAbortController = null;
+        document.removeEventListener('visibilitychange', handleVisibilitySync);
+        window.removeEventListener('focus', handleFocusSync);
+    };
+
+    document.addEventListener('visibilitychange', handleVisibilitySync);
+    window.addEventListener('focus', handleFocusSync);
+
+    app.onteardown = async () => {
+        teardown();
+        return {};
+    };
+
     void connectWithSharedHostContext({
         app,
         chrome,
-        onContextApplied: syncChromeState,
-        onConnected: () => {
-            // Try to restore from persisted widget state (survives refresh on some hosts)
-            const cachedPayload = widgetState.read();
-            if (cachedPayload) {
-                window.setTimeout(() => resolveInitialState(cachedPayload), 50);
-            }
-
-            // Fallback: if no tool data arrives, show a helpful status message
-            window.setTimeout(() => {
-                if (!initialStateResolved) {
-                    resolveInitialState(
-                        undefined,
-                        'Preview unavailable after page refresh. Switch threads or re-run the tool.'
-                    );
+        onContextApplied: () => {
+            const previousDisplayMode = getCurrentDisplayMode();
+            syncChromeState();
+            currentHostContext = app.getHostContext() as Record<string, unknown> | undefined;
+            const nextDisplayMode = getCurrentDisplayMode();
+            const displayModeChanged = previousDisplayMode !== nextDisplayMode;
+            // Clicking a display-mode button blurs the editor first, and the
+            // editor's onBlur handler already persists dirty drafts, so there
+            // is nothing additional to save here.
+            if (
+                previousDisplayMode === 'fullscreen'
+                && nextDisplayMode === 'inline'
+                && currentPayload?.fileType === 'markdown'
+            ) {
+                isExpanded = true;
+                chrome.expanded = true;
+                const restorePayload = inlinePayloadBeforeFullscreen ?? hostPayload;
+                const restoreWasPartial = restorePayload ? parseReadRange(restorePayload.content)?.isPartial === true : false;
+                if (restoreWasPartial && restorePayload) {
+                    localPayloadOverride = restorePayload;
+                    currentPayload = restorePayload;
+                    widgetState.write(restorePayload);
+                    void markdownController.handleInlineExitFromFullscreen(restorePayload).then((freshPayload) => {
+                        if (freshPayload) {
+                            currentPayload = freshPayload;
+                            localPayloadOverride = freshPayload;
+                            widgetState.write(freshPayload);
+                            rerenderCurrent?.();
+                        }
+                    });
+                } else {
+                    void markdownController.handleInlineExitFromFullscreen();
                 }
-            }, 8000);
+                inlinePayloadBeforeFullscreen = undefined;
+            }
+            if (
+                previousDisplayMode !== 'fullscreen'
+                && nextDisplayMode === 'fullscreen'
+                && currentPayload?.fileType === 'markdown'
+            ) {
+                inlinePayloadBeforeFullscreen = currentPayload;
+                if (parseReadRange(currentPayload.content)?.isPartial) {
+                    void markdownController.requestEditMode(currentPayload);
+                }
+            }
+            if (initialStateResolved && displayModeChanged) {
+                rerenderCurrent?.();
+            }
+        },
+        onConnected: () => {
+            currentHostContext = app.getHostContext() as Record<string, unknown> | undefined;
+            pendingCachedPayload = widgetState.read() ?? undefined;
         },
     }).catch(() => {
         renderStatusState(container, 'Failed to connect to host.');
@@ -837,6 +771,6 @@ export function bootstrapApp(): void {
     });
 
     window.addEventListener('beforeunload', () => {
-        shellController?.dispose();
+        teardown();
     }, { once: true });
 }

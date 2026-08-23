@@ -26,7 +26,7 @@ export async function openBrowser(url: string): Promise<void> {
         break;
       case 'win32':
         // Windows 'start' is a shell builtin, use spawn with shell but pass URL as separate arg
-        spawn('cmd', ['/c', 'start', '', url], { shell: false }).on('close', (code) => {
+        spawn('cmd', ['/c', 'start', '', url], { shell: false, windowsHide: true }).on('close', (code) => {
           code === 0 ? resolve() : reject(new Error(`Exit code ${code}`));
         });
         break;
@@ -40,7 +40,10 @@ export async function openBrowser(url: string): Promise<void> {
 /**
  * Open the Desktop Commander welcome page
  */
-export async function openWelcomePage(): Promise<void> {
-  const url = 'https://desktopcommander.app/welcome/';
+export async function openWelcomePage(clientName?: string): Promise<void> {
+  // utm_source is auto-captured by the welcome page's PostHog (and GA4), so
+  // web analytics can segment by MCP client without any web-side changes.
+  const url = 'https://desktopcommander.app/welcome/'
+    + (clientName ? `?utm_source=${encodeURIComponent(clientName)}` : '');
   await openBrowser(url);
 }
