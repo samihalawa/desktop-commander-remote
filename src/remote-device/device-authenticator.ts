@@ -2,6 +2,7 @@ import open from 'open';
 import os from 'os';
 import crypto from 'crypto';
 import { captureRemote } from '../utils/capture.js';
+import { observeServerDate } from './remote-channel.js';
 
 interface AuthSession {
     access_token: string;
@@ -81,6 +82,7 @@ export class DeviceAuthenticator {
                 code_challenge_method: 'S256',
             }),
         });
+        observeServerDate(response.headers.get('date'));
 
         if (!response.ok) {
             const error = await response.json().catch(() => ({ error: 'Unknown error' }));
@@ -98,9 +100,9 @@ export class DeviceAuthenticator {
         const configuredAccountEmail = process.env.DC_REMOTE_ACCOUNT_EMAIL?.trim();
 
         console.log('📋 Please complete authentication:\n');
-        console.log('   1. Open this URL in your browser:');
-        console.log(`      ${deviceAuth.verification_uri}\n`);
-        console.log('   2. Enter this code when prompted:');
+        console.log('   1. Verify this device in your browser:');
+        console.log(`      ${deviceAuth.verification_uri_complete}\n`);
+        console.log('   2. Make sure the code matches:');
         console.log(`      ${deviceAuth.user_code}\n`);
         if (configuredAccountEmail) {
             console.log(`   3. Sign in with: ${configuredAccountEmail}\n`);
@@ -137,6 +139,9 @@ export class DeviceAuthenticator {
                         code_verifier: codeVerifier,
                     }),
                 });
+                // The response that delivers the session states the server's
+                // time; correct the clock before that session is used.
+                observeServerDate(response.headers.get('date'));
 
                 // Parse response body exactly once
                 const data: PollResponse = await response.json().catch(() => ({ error: 'unknown' }));

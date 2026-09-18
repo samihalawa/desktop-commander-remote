@@ -84,12 +84,19 @@ Run from the project repository without global installation:
 desktop-commander-device
 ```
 
-**With session persistence** (optional):
+**Without session persistence** (opt out):
 ```bash
-desktop-commander-device --persist-session
+desktop-commander-device --no-persist-session
 ```
 
-> **Note**: By default, only the device ID is persisted. Use `--persist-session` to also save authentication tokens between restarts. This allows the device to reconnect automatically without re-authentication.
+> **Note**: The device ID and authentication tokens are persisted by default to `~/.desktop-commander-device/device.json` (mode 0600), so the device reconnects without re-authorization. Pass `--no-persist-session` to keep tokens in memory only — the device then requires a full browser re-authorization on every start, and each one leaves a live server-side session behind.
+
+**Log out locally and remove the saved device credentials:**
+```bash
+desktop-commander remote --logout
+```
+
+This removes `~/.desktop-commander-device/device.json` from the current machine. It does not revoke the device from the Remote MCP dashboard; use **Revoke** there if you also want to invalidate the remote device authorization.
 
 **If using local installation** from the project root directory:
 
@@ -118,9 +125,9 @@ On first run, the device uses the **OAuth 2.0 Device Authorization Flow** for se
    - ✅ Device code received
 
 📋 Please complete authentication:
-   1. Open this URL in your browser:
-      https://test.acidpictures.org/device/verify
-   2. Enter this code when prompted:
+   1. Verify this device in your browser:
+      https://test.acidpictures.org/verify-device?user_code=BLPU-9E9R
+   2. Make sure the code matches:
       BLPU-9E9R
    Code expires in 15 minutes.
    - ⏳ Waiting for authorization...
@@ -152,7 +159,7 @@ This enables verbose logging and ensures the device picks up usage of a local MC
 
 *   **You are in control**: The device runs on *your* machine. You can stop it at any time (`Ctrl+C`) to cut off access.
 *   **Local Execution**: Commands are executed locally under your user permissions.
-*   **Audit Logs**: The local MCP server logs all actions (see the main Desktop Commander README for log locations).
+*   **Local audit/history logs**: The local MCP server records tool calls on the device. See the main Desktop Commander README for exactly what is stored, log locations, and retention/rotation behavior. The Remote service does not currently retain command arguments/results as a historical server-side audit trail.
 
 ---
 *Powered by Desktop Commander MCP*
