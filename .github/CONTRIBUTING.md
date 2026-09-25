@@ -6,7 +6,7 @@ Thanks for your interest in contributing!
 
 1. Fork the repo and clone locally
 2. `npm install && npm run build`
-3. Compile the menubar app: `swiftc menubar/DCRemoteMenuBar.swift -framework Cocoa -framework WebKit -o /tmp/DCRemoteMenuBar`
+3. Compile the menubar app: `swiftc -target arm64-apple-macos13.0 menubar/DCRemoteMenuBar.swift -framework Cocoa -framework WebKit -o /tmp/DCRemoteMenuBar` (always pass `-target …-macos13.0` to match `LSMinimumSystemVersion`)
 4. Make your changes on a feature branch
 5. Test thoroughly on macOS 12+
 6. Open a PR against `main`

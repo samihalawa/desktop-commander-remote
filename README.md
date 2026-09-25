@@ -127,9 +127,14 @@ git clone https://github.com/samihalawa/desktop-commander-remote
 cd desktop-commander-remote
 
 # Compile Swift menubar app
-swiftc menubar/DCRemoteMenuBar.swift \
-  -framework Cocoa -framework WebKit \
-  -o /tmp/DCRemoteMenuBar.app/Contents/MacOS/DCRemoteMenuBar
+# Pin the deployment target: without -target, swiftc uses the host SDK's
+# macOS version and the app refuses to launch on older systems.
+for arch in arm64 x86_64; do
+  swiftc -O -target $arch-apple-macos13.0 menubar/DCRemoteMenuBar.swift \
+    -framework Cocoa -framework WebKit -o /tmp/DCRemoteMenuBar-$arch
+done
+lipo -create /tmp/DCRemoteMenuBar-arm64 /tmp/DCRemoteMenuBar-x86_64 \
+  -output /tmp/DCRemoteMenuBar.app/Contents/MacOS/DCRemoteMenuBar
 
 # Build Node daemon
 npm install && npm run build
